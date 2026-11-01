@@ -536,6 +536,68 @@ class BlockCacheConfig {
     return *this;
   }
 
+  // Offload data checksumming (fused with the value copy on the write path)
+  // to Intel DSA via the DTO library. Requires data checksum to be enabled
+  // and CacheLib built with BUILD_WITH_DTO. @minSize is the minimum value
+  // size to use the offloaded path; smaller values are checksummed in
+  // software, since submitting and polling a descriptor costs about what the
+  // CPU needs to CRC 16-32 KiB (16 KiB measured as the break-even).
+  BlockCacheConfig& setChecksumOffload(bool checksumOffload,
+                                       uint32_t minSize = 16384) noexcept {
+    checksumOffload_ = checksumOffload;
+    checksumOffloadMinSize_ = minSize;
+    return *this;
+  }
+
+  // Separate minimum size for offloading checksum VERIFICATION on the read,
+  // reclaim and reinsertion paths; 0 = same as the write-path gate. Verifying
+  // has no CPU work to overlap with the accelerator, so its break-even is
+  // higher than the fused write.
+  BlockCacheConfig& setChecksumOffloadReadMinSize(uint32_t minSize) noexcept {
+    checksumOffloadReadMinSize_ = minSize;
+    return *this;
+  }
+
+  // Cache-control hint on the fused write-path copy (default true): steer the
+  // value bytes toward the CPU cache. Turn off when the next reader of the
+  // region buffer is the device (directFlush / flush copy offload).
+  BlockCacheConfig& setChecksumOffloadCacheControl(bool enable) noexcept {
+    checksumOffloadCacheControl_ = enable;
+    return *this;
+  }
+
+  // Region reclaim/cleanup verify values as DSA Batch descriptors (<= 64 per
+  // submission) instead of one descriptor each. Default false; needs the
+  // checksum offload. See BlockCache::Config::checksumOffloadBatchReclaim.
+  BlockCacheConfig& setChecksumOffloadBatchReclaim(bool enable) noexcept {
+    checksumOffloadBatchReclaim_ = enable;
+    return *this;
+  }
+
+  // Coalesce write-path fused copy+CRC descriptors across the fibers of a
+  // NavyThread (yielding only when siblings are runnable). Default false;
+  // measured neutral to slightly negative. See BlockCache::Config.
+  BlockCacheConfig& setChecksumOffloadBatch(bool enable) noexcept {
+    checksumOffloadBatch_ = enable;
+    return *this;
+  }
+
+  // Defer the checksum of values below the offload gate to region flush,
+  // where they are batched on DSA (implies skipInMemValueVerify). Default
+  // false. See BlockCache::Config::checksumDeferSmall.
+  BlockCacheConfig& setChecksumDeferSmall(bool enable) noexcept {
+    checksumDeferSmall_ = enable;
+    return *this;
+  }
+
+  // Lookups served from the in-memory region buffer skip the value checksum
+  // (the bytes never left DRAM; the header checksum still covers the
+  // descriptor). Default false. See BlockCache::Config::skipInMemValueVerify.
+  BlockCacheConfig& setSkipInMemValueVerify(bool enable) noexcept {
+    skipInMemValueVerify_ = enable;
+    return *this;
+  }
+
   BlockCacheConfig& setPreciseRemove(bool preciseRemove) noexcept {
     preciseRemove_ = preciseRemove;
     return *this;
@@ -558,6 +620,17 @@ class BlockCacheConfig {
 
   BlockCacheConfig& setDirectFlush(bool enable) noexcept {
     directFlush_ = enable;
+    return *this;
+  }
+
+  // When directFlush is off: copy the region buffer into the flush write
+  // buffer with one Intel DSA Memory Move instead of memcpy. Requires
+  // CacheLib built with BUILD_WITH_DTO; falls back to memcpy if DSA is
+  // unusable. The write buffers are pooled, so after the first flush per
+  // buffer their pages are resident; a work queue with block-on-fault covers
+  // the first touch.
+  BlockCacheConfig& setFlushCopyOffload(bool enable) noexcept {
+    flushCopyOffload_ = enable;
     return *this;
   }
 
@@ -617,6 +690,25 @@ class BlockCacheConfig {
 
   bool getDataChecksum() const { return dataChecksum_; }
 
+  bool getChecksumOffload() const { return checksumOffload_; }
+
+  uint32_t getChecksumOffloadMinSize() const { return checksumOffloadMinSize_; }
+
+  uint32_t getChecksumOffloadReadMinSize() const {
+    return checksumOffloadReadMinSize_;
+  }
+
+  bool getChecksumOffloadCacheControl() const {
+    return checksumOffloadCacheControl_;
+  }
+
+  bool getChecksumOffloadBatchReclaim() const {
+    return checksumOffloadBatchReclaim_;
+  }
+  bool getChecksumOffloadBatch() const { return checksumOffloadBatch_; }
+  bool getChecksumDeferSmall() const { return checksumDeferSmall_; }
+  bool getSkipInMemValueVerify() const { return skipInMemValueVerify_; }
+
   uint64_t getSize() const { return size_; }
 
   bool isRegionManagerFlushAsync() const { return regionManagerFlushAsync_; }
@@ -624,6 +716,7 @@ class BlockCacheConfig {
   bool isRecoverEvictionPolicy() const { return recoverEvictionPolicy_; }
 
   bool isDirectFlush() const { return directFlush_; }
+  bool isFlushCopyOffload() const { return flushCopyOffload_; }
 
   bool isCombinedEntryBlockEnabled() const { return useCombinedEntryBlock_; }
 
@@ -660,6 +753,16 @@ class BlockCacheConfig {
   uint32_t regionSize_{16 * 1024 * 1024};
   // Whether enabling data checksum for Navy BlockCache.
   bool dataChecksum_{true};
+  // Whether to offload data checksumming to Intel DSA (fused with the value
+  // copy on the write path), and the minimum value size to do so.
+  bool checksumOffload_{false};
+  uint32_t checksumOffloadMinSize_{16384};
+  uint32_t checksumOffloadReadMinSize_{0};
+  bool checksumOffloadCacheControl_{true};
+  bool checksumOffloadBatchReclaim_{false};
+  bool checksumOffloadBatch_{false};
+  bool checksumDeferSmall_{false};
+  bool skipInMemValueVerify_{false};
   // Whether to remove an item by checking the key (true) or only the hash value
   // (false).
   bool preciseRemove_{false};
@@ -676,6 +779,9 @@ class BlockCacheConfig {
 
   // Whether to write region buffer directly without intermediate copy.
   bool directFlush_{false};
+
+  // Whether to do the flush copy (when not directFlush) on Intel DSA.
+  bool flushCopyOffload_{false};
 
   // Whether to use Combined entry block (For index entries and small sized
   // items).
@@ -739,6 +845,14 @@ class BigHashConfig {
     return *this;
   }
 
+  // Offload bucket checksumming to Intel DSA via the DTO library. Most
+  // beneficial with large buckets (16KB+). Requires CacheLib built with
+  // BUILD_WITH_DTO.
+  BigHashConfig& setChecksumOffload(bool checksumOffload) noexcept {
+    checksumOffload_ = checksumOffload;
+    return *this;
+  }
+
   bool isBloomFilterEnabled() const { return bucketBfSize_ > 0; }
 
   unsigned int getSizePct() const { return sizePct_; }
@@ -750,6 +864,8 @@ class BigHashConfig {
   uint64_t getSmallItemMaxSize() const { return smallItemMaxSize_; }
 
   uint8_t getNumMutexesPower() const { return numMutexesPower_; }
+
+  bool getChecksumOffload() const { return checksumOffload_; }
 
  private:
   // Percentage of how much of the device out of all is given to BigHash
@@ -766,6 +882,8 @@ class BigHashConfig {
   uint64_t smallItemMaxSize_{};
   // numMutexes = 1 << numMutexesPower_.
   uint8_t numMutexesPower_{14};
+  // Whether to offload bucket checksumming to Intel DSA.
+  bool checksumOffload_{false};
 };
 
 // Config for a pair of small,large engines.

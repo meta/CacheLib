@@ -18,6 +18,8 @@
 
 #include <folly/fibers/TimedMutex.h>
 
+#include <vector>
+
 #include "cachelib/common/ConditionVariable.h"
 #include "cachelib/common/Profiled.h"
 #include "cachelib/navy/block_cache/Types.h"
@@ -162,6 +164,21 @@ class Region {
   // This could block if there are active readers
   std::unique_ptr<Buffer> detachBuffer();
 
+  // A value whose checksum BlockCache deferred to flush time (small values
+  // under the DSA per-op gate are batched there). Offsets are relative to
+  // the region buffer; csOffset is the EntryDesc::cs field to patch.
+  struct PendingChecksum {
+    uint32_t valueOffset;
+    uint32_t valueSize;
+    uint32_t csOffset;
+  };
+  void addPendingChecksum(PendingChecksum p);
+  std::vector<PendingChecksum> takePendingChecksums();
+  // Flush-path access to the attached buffer: a read-only view, and a 32-bit
+  // store used to patch deferred checksums (serialized with readFromBuffer).
+  BufferView bufferView() const;
+  void storeU32(uint32_t offset, uint32_t value);
+
   // Flushes the attached buffer by calling the callBack function.
   // The callBack function is expected to write to the underlying device.
   // The callback function should return true if successfully flushed the
@@ -244,6 +261,7 @@ class Region {
   uint32_t lastEntryEndOffset_{0};
   uint32_t numItems_{0};
   std::unique_ptr<Buffer> buffer_{nullptr};
+  std::vector<PendingChecksum> pendingChecksums_;
 
   mutable trace::Profiled<TimedMutex, "cachelib:navy:bc_region"> lock_{
       TimedMutex::Options(false)};

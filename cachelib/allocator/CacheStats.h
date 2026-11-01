@@ -456,6 +456,11 @@ struct GlobalCacheStats {
   // attempts made from nvm cache to allocate an item for promotion
   uint64_t numNvmAllocAttempts{0};
 
+  // flash-hit copy-outs performed by Intel DSA, bytes moved, CPU fallbacks
+  uint64_t numNvmCopyOutOffloaded{0};
+  uint64_t numNvmCopyOutOffloadedBytes{0};
+  uint64_t numNvmCopyOutFallbacks{0};
+
   // attempts made from nvm cache to allocate an item for its destructor
   uint64_t numNvmAllocForItemDestructor{0};
   // heap allocate errors for item destructor

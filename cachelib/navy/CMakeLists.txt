@@ -32,6 +32,7 @@ add_library (cachelib_navy
   block_cache/RegionManager.cpp
   block_cache/SparseMapIndex.cpp
   common/Buffer.cpp
+  common/ChecksumOffload.cpp
   common/Device.cpp
   common/FdpNvme.cpp
   common/Hash.cpp
@@ -65,6 +66,10 @@ target_link_libraries(cachelib_navy PUBLIC
   GTest::gmock
   )
 
+# DTO (DSA offload runtime) is resolved in the top-level CMakeLists.txt and
+# linked PUBLIC into cachelib_common, so cachelib_navy inherits
+# DTO::dto_explicit and the CACHELIB_BUILD_WITH_DTO definition transitively.
+
 install(TARGETS cachelib_navy
         EXPORT cachelib-exports
         DESTINATION ${LIB_INSTALL_DIR} )
@@ -96,6 +101,7 @@ if (BUILD_TESTS)
   endfunction()
 
   add_source_test (common/tests/BufferTest.cpp)
+  add_source_test (common/tests/ChecksumOffloadTest.cpp)
   add_source_test (common/tests/HashTest.cpp)
   add_source_test (common/tests/UtilsTest.cpp)
   add_source_test (bighash/tests/BucketStorageTest.cpp)

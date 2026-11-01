@@ -27,7 +27,8 @@ namespace navy {
 // Default hash function
 uint64_t hashBuffer(BufferView key, uint64_t seed = 0);
 
-// Default checksumming function
+// Default checksumming function: CRC-32C (Castagnoli) with raw seed
+// semantics (no final inversion), DSA-offload compatible.
 uint32_t checksum(BufferView data, uint32_t startingChecksum = 0);
 
 // Convenience utils to convert a piece of buffer to a hashed key

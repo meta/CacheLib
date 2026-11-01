@@ -18,6 +18,7 @@
 
 #include <folly/Random.h>
 
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Hash.h"
 
 namespace facebook::cachelib::navy {
@@ -51,6 +52,13 @@ uint32_t Bucket::computeChecksum(BufferView view) {
   constexpr auto kChecksumStart = sizeof(checksum_);
   auto data = view.slice(kChecksumStart, view.size() - kChecksumStart);
   return navy::checksum(data);
+}
+
+uint32_t Bucket::computeChecksumOffloaded(BufferView view,
+                                          folly::FunctionRef<void()> overlap) {
+  constexpr auto kChecksumStart = sizeof(checksum_);
+  auto data = view.slice(kChecksumStart, view.size() - kChecksumStart);
+  return checksumWithOverlap(data, overlap);
 }
 
 Bucket& Bucket::initNew(MutableBufferView view, uint64_t generationTime) {

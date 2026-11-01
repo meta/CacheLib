@@ -245,6 +245,51 @@ TEST(BlockCache, InsertLookup) {
   EXPECT_EQ(0, hits[3]);
 }
 
+// Exercises the fused copy+checksum write path (DSA-offloaded when built
+// with DTO support, software otherwise). minSize of 0 forces every insert
+// through the fused path; values large and small verify both roundtrip and
+// checksum verification on lookup.
+TEST(BlockCache, InsertLookupChecksumOffload) {
+  std::vector<CacheEntry> log;
+
+  std::vector<uint32_t> hits(4);
+  auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
+  auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+  auto ex = makeJobScheduler();
+  auto config = makeConfig(std::move(policy), *device);
+  config.checksum = true;
+  config.checksumOffload = true;
+  config.checksumOffloadMinSize = 0;
+  auto engine = makeEngine(std::move(config));
+  auto driver = makeDriver(std::move(engine), std::move(ex));
+
+  BufferGen bg;
+  for (size_t i = 0; i < 16; i++) {
+    // Mix of sizes: small and near-region-slot-size values
+    CacheEntry e{bg.gen(8), bg.gen(i % 2 == 0 ? 800 : 3000)};
+    EXPECT_EQ(Status::Ok,
+              driver->insertAsync(e.key(), e.value(), nullptr, 0 /* poolId */,
+                                  0 /* expiryTime */));
+    log.push_back(std::move(e));
+  }
+  driver->flush();
+
+  for (auto& e : log) {
+    Buffer value;
+    uint32_t lat = 0;
+    EXPECT_EQ(Status::Ok, driver->lookup(e.key(), value, lat));
+    EXPECT_EQ(e.value(), value.view());
+  }
+
+  // No checksum errors must have been recorded
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType) {
+    if (name.contains("checksum_error")) {
+      EXPECT_EQ(0, count) << name;
+    }
+  }});
+}
+
 TEST(BlockCache, WriteEntry_AlignedEntries_TracksSerializedAndPaddingBytes) {
   std::vector<uint32_t> hits(4);
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);

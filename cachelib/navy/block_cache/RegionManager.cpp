@@ -16,11 +16,42 @@
 
 #include "cachelib/navy/block_cache/RegionManager.h"
 
+#include <sys/mman.h>
+
+#include <algorithm>
+
+#include "cachelib/navy/common/ChecksumOffload.h"
+
 #include "cachelib/common/Profiled.h"
 #include "cachelib/common/inject_pause.h"
 #include "cachelib/navy/common/Utils.h"
 
 namespace facebook::cachelib::navy {
+namespace {
+// Populate a buffer's pages so that the first write into it - by the CPU or
+// by a DMA engine - does not fault. A DSA descriptor that touches an
+// unpopulated page stalls on an IOMMU page request, a kernel round trip per
+// 4 KiB page that also holds up the other descriptors queued on that engine;
+// measured on the BigCache replay as ~100x the per-op accelerator wait and
+// +190% CPU when the region buffers came from a fresh mmap. The in-memory
+// buffers are all used, so populating them at construction commits nothing
+// that would not be committed anyway.
+void populateBuffer(Buffer& buf) {
+  auto* data = buf.data();
+  const auto size = buf.size();
+#ifdef MADV_POPULATE_WRITE
+  if (::madvise(data, size, MADV_POPULATE_WRITE) == 0) {
+    return;
+  }
+#endif
+  // Older kernels: touch one byte per page. Buffer contents are undefined
+  // until written, so the zero is harmless.
+  for (size_t off = 0; off < size; off += 4096) {
+    data[off] = 0;
+  }
+}
+} // namespace
+
 RegionManager::RegionManager(uint32_t numRegions,
                              uint64_t regionSize,
                              uint64_t baseOffset,
@@ -37,7 +68,8 @@ RegionManager::RegionManager(uint32_t numRegions,
                              bool workerFlushAsync,
                              bool allowReadDuringReclaim,
                              bool recoverEvictionPolicy,
-                             bool directFlush)
+                             bool directFlush,
+                             bool flushCopyOffload)
     : numPriorities_{numPriorities},
       inMemBufFlushRetryLimit_{inMemBufFlushRetryLimit},
       numRegions_{numRegions},
@@ -51,6 +83,7 @@ RegionManager::RegionManager(uint32_t numRegions,
       allowReadDuringReclaim_(allowReadDuringReclaim),
       recoverEvictionPolicy_{recoverEvictionPolicy},
       directFlush_{directFlush},
+      flushCopyOffload_{flushCopyOffload},
       evictCb_{evictCb},
       cleanupCb_{cleanupCb},
       numInMemBuffers_{numInMemBuffers},
@@ -58,6 +91,20 @@ RegionManager::RegionManager(uint32_t numRegions,
   XLOGF(INFO,
         "{} regions, {} bytes each, allowReadDuringReclaim {}, directFlush {}",
         numRegions_, regionSize_, allowReadDuringReclaim, directFlush);
+  if (flushCopyOffload_ && directFlush_) {
+    XLOG(INFO) << "RegionManager: directFlush set, flush copy offload is moot";
+    flushCopyOffload_ = false;
+  }
+  if (flushCopyOffload_) {
+    // probe at the size the flush will actually submit
+    flushCopyOffload_ = copyOffloadSelfCheck(regionSize_);
+    if (flushCopyOffload_) {
+      XLOG(INFO) << "RegionManager: flush copy offload to DSA active";
+    } else {
+      XLOG(WARN) << "RegionManager: flush copy offload requested but the "
+                    "DTO/DSA self-check failed; using memcpy";
+    }
+  }
   for (uint32_t i = 0; i < numRegions; i++) {
     regions_[i] = std::make_unique<Region>(RegionId{i}, regionSize_);
   }
@@ -67,7 +114,16 @@ RegionManager::RegionManager(uint32_t numRegions,
   for (uint32_t i = 0; i < numInMemBuffers_; i++) {
     buffers_.push_back(
         std::make_unique<Buffer>(device.makeIOBuffer(regionSize_)));
+    populateBuffer(*buffers_.back());
   }
+
+  // Every flush holds one in-memory buffer, so numInMemBuffers bounds the
+  // number of write buffers ever needed at once; keeping up to that many
+  // means a flush burst never allocates (and frees) buffers under a DMA
+  // engine that may still hold translations for them.
+  writeBufPoolCap_ = std::max<size_t>(
+      {size_t{2}, 2 * static_cast<size_t>(numWorkers),
+       static_cast<size_t>(numInMemBuffers_)});
 
   for (uint32_t i = 0; i < numWorkers; i++) {
     // Thread names are truncated to 15 characters; keep the prefix short so
@@ -127,9 +183,64 @@ void RegionManager::reset() {
   resetEvictionPolicy();
 }
 
+Buffer RegionManager::acquireWriteBuffer() {
+  {
+    std::lock_guard<std::mutex> l{writeBufPoolMutex_};
+    if (!writeBufPool_.empty()) {
+      auto buf = std::move(writeBufPool_.back());
+      writeBufPool_.pop_back();
+      return buf;
+    }
+  }
+  // Pool empty (startup, or more concurrent flushes than the cap): allocate;
+  // the buffer joins the pool on release if there is room. When the copy into
+  // it is done by DSA, populate it first (see populateBuffer).
+  auto buf = device_.makeIOBuffer(regionSize_);
+  if (flushCopyOffload_) {
+    populateBuffer(buf);
+  }
+  return buf;
+}
+
+void RegionManager::releaseWriteBuffer(Buffer buf) {
+  std::lock_guard<std::mutex> l{writeBufPoolMutex_};
+  if (writeBufPool_.size() < writeBufPoolCap_) {
+    writeBufPool_.push_back(std::move(buf));
+  }
+  // else: drop it; the cap bounds memory kept after a flush burst
+}
+
+void RegionManager::drainPendingChecksums(Region& region) {
+  auto pending = region.takePendingChecksums();
+  if (pending.empty()) {
+    return;
+  }
+  const auto view = region.bufferView();
+  BatchChecksumOp op;
+  size_t i = 0;
+  while (i < pending.size()) {
+    op.reset();
+    const size_t first = i;
+    for (; i < pending.size() && !op.full(); ++i) {
+      op.addChecksum(view.slice(pending[i].valueOffset, pending[i].valueSize));
+    }
+    op.submit();
+    op.wait();
+    for (size_t j = first; j < i; ++j) {
+      region.storeU32(pending[j].csOffset, op.crc(j - first));
+    }
+    deferredChecksumBatches_.inc();
+  }
+  deferredChecksumCount_.add(pending.size());
+  addDeferredChecksumStats(pending.size());
+}
+
 Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
   auto& region = getRegion(rid);
-  auto callBack = [this](RelAddress addr, BufferView view) {
+  auto callBack = [this, &region](RelAddress addr, BufferView view) {
+    // Deferred value checksums must be in the buffer before it is copied
+    // or written; no writer is active once Region::flushBuffer calls us.
+    drainPendingChecksums(region);
     if (directFlush_) {
       XDCHECK_EQ(0u, reinterpret_cast<uintptr_t>(view.data()) %
                          device_.getIOAlignmentSize());
@@ -138,9 +249,34 @@ Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
         return false;
       }
     } else {
-      auto writeBuffer = device_.makeIOBuffer(view.size());
-      writeBuffer.copyFrom(0, view);
-      if (!deviceWrite(addr, std::move(writeBuffer))) {
+      auto writeBuffer = acquireWriteBuffer();
+      XDCHECK_GE(writeBuffer.size(), view.size());
+      if (flushCopyOffload_) {
+        // One 16 MiB Memory Move descriptor (a single descriptor already runs
+        // at full device speed, ~55 GB/s measured; batching adds nothing and
+        // DTO's batch path cannot turn cache control off). Cache control off:
+        // the write buffer is read next by the storage device's DMA. The
+        // flush fiber sleeps on a timed baton instead of spinning, since this
+        // thread rarely has other runnable fibers and the copy takes ~1 ms
+        // under load. Destination pages must be resident (pre-touched buffers)
+        // or the work queue configured with block-on-fault.
+        if (copyLargeWithOffload(writeBuffer.data(), view.data(), view.size(),
+                                 1 /* parts */, false /* cacheControl */,
+                                 LargeCopyWait::kSleep, 200 /* us */)) {
+          flushCopyOffloadCount_.inc();
+        } else {
+          flushCopyFallbackCount_.inc();
+        }
+      } else {
+        writeBuffer.copyFrom(0, view);
+      }
+      // Write through the view overload: the buffer stays ours and returns to
+      // the pool. Device::write(BufferView) copies only when an encryptor is
+      // configured, so this is not a second copy.
+      const bool ok =
+          deviceWrite(addr, BufferView{view.size(), writeBuffer.data()});
+      releaseWriteBuffer(std::move(writeBuffer));
+      if (!ok) {
         return false;
       }
     }
@@ -162,7 +298,10 @@ void RegionManager::detachBuffer(const RegionId& rid) {
 
 void RegionManager::cleanupBufferOnFlushFailure(const RegionId& regionId) {
   auto& region = getRegion(regionId);
-  auto callBack = [this](RegionId rid, BufferView buffer) {
+  auto callBack = [this, &region](RegionId rid, BufferView buffer) {
+    // The cleanup callback verifies value checksums; patch the deferred
+    // ones first (the region has no active writers here either).
+    drainPendingChecksums(region);
     cleanupCb_(rid, buffer);
     numInMemBufWaitingFlush_.dec();
     numInMemBufFlushFailures_.inc();
@@ -769,6 +908,49 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_external_fragmentation", externalFragmentation_.get());
   visitor("navy_bc_physical_written", physicalWrittenCount_.get(),
           CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_flush_copy_offloaded", flushCopyOffloadCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_flush_copy_fallbacks", flushCopyFallbackCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  {
+    const auto w = getCopyLargeWaitStats();
+    visitor("navy_bc_flush_copy_calls", w.calls);
+    visitor("navy_bc_flush_copy_yields", w.yields);
+    visitor("navy_bc_flush_copy_polls", w.polls);
+    visitor("navy_bc_flush_copy_sleeps", w.sleeps);
+    const auto c = getChecksumWaitStats();
+    visitor("navy_bc_csum_wait_ops", c.calls);
+    visitor("navy_bc_csum_wait_polls", c.polls);
+    visitor("navy_bc_csum_wait_us", c.waitUs);
+    visitor("navy_bc_csum_wait_blocks", c.sleeps);
+    visitor("navy_bc_csum_wait_yields", c.yields);
+    const auto bs = getChecksumBatchStats();
+    visitor("navy_bc_csum_batches", bs.batches);
+    visitor("navy_bc_csum_batch_members", bs.members);
+    visitor("navy_bc_csum_batch_singles", bs.singles);
+    visitor("navy_bc_csum_batch_leaders", bs.leaders);
+    visitor("navy_bc_csum_batch_waiters", bs.waiters);
+    visitor("navy_bc_csum_batch_fallbacks", bs.fallbacks);
+    visitor("navy_bc_csum_deferred", deferredChecksumCount_.get());
+    visitor("navy_bc_csum_deferred_batches", deferredChecksumBatches_.get());
+    const auto o = getCopyOutWaitStats();
+    visitor("navy_bc_copyout_wait_ops", o.calls);
+    visitor("navy_bc_copyout_wait_polls", o.polls);
+    visitor("navy_bc_copyout_wait_us", o.waitUs);
+    visitor("navy_bc_copyout_wait_blocks", o.sleeps);
+    visitor("navy_bc_flush_copy_submit_us", w.submitUs);
+    visitor("navy_bc_flush_copy_wait_us", w.waitUs);
+    // Device failures redone on the CPU. Non-zero here with the offload
+    // "active" means descriptors are being rejected (e.g. a work queue
+    // without block-on-fault) and the accelerator is doing nothing.
+    visitor("navy_bc_csum_device_fallbacks", c.fallbacks);
+    visitor("navy_bc_copyout_device_fallbacks", o.fallbacks);
+    visitor("navy_bc_flush_copy_device_fallbacks", w.fallbacks);
+    {
+      std::lock_guard<std::mutex> l{writeBufPoolMutex_};
+      visitor("navy_bc_flush_writebuf_pooled", writeBufPool_.size());
+    }
+  }
   visitor("navy_bc_inmem_active", numInMemBufActive_.get());
   visitor("navy_bc_inmem_waiting_flush", numInMemBufWaitingFlush_.get());
   visitor("navy_bc_inmem_flush_retries", numInMemBufFlushRetries_.get(),

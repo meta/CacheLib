@@ -16,6 +16,8 @@
 
 #include "cachelib/navy/block_cache/Region.h"
 
+#include <utility>
+
 #include "cachelib/navy/common/NavyThread.h"
 
 namespace facebook::cachelib::navy {
@@ -144,7 +146,31 @@ void Region::reset() {
   activeInMemReaders_ = 0;
   lastEntryEndOffset_ = 0;
   numItems_ = 0;
+  pendingChecksums_.clear();
   cond_.notifyAll();
+}
+
+void Region::addPendingChecksum(PendingChecksum p) {
+  std::lock_guard l{lock_};
+  pendingChecksums_.push_back(p);
+}
+
+std::vector<Region::PendingChecksum> Region::takePendingChecksums() {
+  std::lock_guard l{lock_};
+  return std::exchange(pendingChecksums_, {});
+}
+
+BufferView Region::bufferView() const {
+  std::lock_guard l{lock_};
+  XDCHECK_NE(buffer_, nullptr);
+  return buffer_->view();
+}
+
+void Region::storeU32(uint32_t offset, uint32_t value) {
+  std::lock_guard l{lock_};
+  XDCHECK_NE(buffer_, nullptr);
+  XDCHECK_LE(offset + sizeof(value), buffer_->size());
+  memcpy(buffer_->data() + offset, &value, sizeof(value));
 }
 
 void Region::close(RegionDescriptor&& desc) {

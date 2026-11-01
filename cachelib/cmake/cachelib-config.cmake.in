@@ -35,6 +35,13 @@ find_dependency(fizz )
 find_dependency(wangle)
 find_dependency(FBThrift)
 
+# When cachelib was built with DSA checksum offload, cachelib_navy links the
+# DTO runtime; resolve its imported target for consumers. A DTO fetched and
+# built in-tree installs its package into this same prefix.
+if (@BUILD_WITH_DTO@)
+  find_dependency(DTO 1.2 CONFIG)
+endif()
+
 if (NOT TARGET cachelib)
 	include("${CACHELIB_CMAKE_DIR}/cachelib-targets.cmake")
 endif()

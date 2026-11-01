@@ -431,6 +431,12 @@ void CacheBase::updateGlobalCacheStats(const std::string& statPrefix) const {
   if (stats.nvmCacheEnabled) {
     counters_.updateDelta(statPrefix + "nvm.alloc_attempts",
                           stats.numNvmAllocAttempts);
+    counters_.updateDelta(statPrefix + "nvm.copy_out_offloaded",
+                          stats.numNvmCopyOutOffloaded);
+    counters_.updateDelta(statPrefix + "nvm.copy_out_offloaded_bytes",
+                          stats.numNvmCopyOutOffloadedBytes);
+    counters_.updateDelta(statPrefix + "nvm.copy_out_fallbacks",
+                          stats.numNvmCopyOutFallbacks);
     counters_.updateDelta(statPrefix + "nvm.destructor_alloc",
                           stats.numNvmAllocForItemDestructor);
     counters_.updateDelta(statPrefix + "nvm.destructor_alloc_errors",

@@ -51,6 +51,29 @@ target_link_libraries(cachelib_common PUBLIC
   ${XXHASH_LIBRARY}
 )
 
+if (BUILD_WITH_DTO)
+  # PUBLIC so the DTO headers/link dependency and the compile definition
+  # propagate to every cachelib library and to installed-package consumers.
+  # DTO itself is resolved (installed package or pinned fetch) in the
+  # top-level CMakeLists.txt.
+  #
+  # Link the explicit variant of the library: the dto_* API without DTO's
+  # memcpy/memset/memmove/memcmp interposers, so building cachelib with DTO
+  # does not send every large libc copy in the process to DSA. Transparent
+  # interception, where wanted (cachebench's --intercept arm), is an
+  # LD_PRELOAD of libdto.so at run time.
+  if (TARGET DTO::dto_explicit)
+    target_link_libraries(cachelib_common PUBLIC DTO::dto_explicit)
+  else()
+    message(WARNING
+      "DTO::dto_explicit is not available (DTO built with "
+      "DTO_BUILD_EXPLICIT=OFF); linking DTO::dto, which interposes the libc "
+      "mem* calls of the whole process")
+    target_link_libraries(cachelib_common PUBLIC DTO::dto)
+  endif()
+  target_compile_definitions(cachelib_common PUBLIC CACHELIB_BUILD_WITH_DTO)
+endif()
+
 install(TARGETS cachelib_common
         EXPORT cachelib-exports
         DESTINATION ${LIB_INSTALL_DIR} )

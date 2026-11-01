@@ -79,6 +79,30 @@ TEST(BigHash, InsertAndRemove) {
   EXPECT_EQ(Status::NotFound, bh.remove(makeHK("key")));
 }
 
+// Exercises the offloaded bucket-checksum path (DSA when built with DTO
+// support, software otherwise), including the bloom-filter-rebuild overlap
+// in insert/remove and offloaded verification in readBucket.
+TEST(BigHash, InsertRemoveChecksumOffload) {
+  BigHash::Config config;
+  setLayout(config, 128, 2);
+  config.checksumOffload = true;
+  auto device = std::make_unique<NiceMock<MockDevice>>(config.cacheSize, 128);
+  config.device = device.get();
+
+  BigHash bh(std::move(config));
+
+  Buffer value;
+  uint32_t lat = 0;
+  EXPECT_EQ(Status::Ok,
+            bh.insert(makeHK("key"), makeView("12345"), 0 /* poolId */,
+                      0 /* expiryTime */));
+  EXPECT_EQ(Status::Ok, bh.lookup(makeHK("key"), value, lat));
+  EXPECT_EQ(makeView("12345"), value.view());
+
+  EXPECT_EQ(Status::Ok, bh.remove(makeHK("key")));
+  EXPECT_EQ(Status::NotFound, bh.lookup(makeHK("key"), value, lat));
+}
+
 // without bloom filters, could exist always returns true.
 TEST(BigHash, CouldExistWithoutBF) {
   BigHash::Config config;

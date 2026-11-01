@@ -50,6 +50,24 @@ class BlockCacheProto {
   // Enable data checksumming (default: disabled)
   virtual void setChecksum(bool enable) = 0;
 
+  // (Optional) Offload data checksumming to Intel DSA (fused with the value
+  // copy on the write path) for values of at least @minSize bytes. Requires
+  // checksumming enabled and a build with DTO support.
+  virtual void setChecksumOffload(bool enable, uint32_t minSize) = 0;
+
+  // (Optional) Separate size gate for read-side checksum verification;
+  // 0 = same as the write gate. (Optional) Cache-control hint on the fused
+  // write-path copy (default on). See BlockCache::Config.
+  virtual void setChecksumOffloadReadMinSize(uint32_t minSize) = 0;
+  virtual void setChecksumOffloadCacheControl(bool enable) = 0;
+  // (Optional) Batched value verification in reclaim/cleanup, fiber-coalesced
+  // write batching, deferred small-value checksums, skipping value
+  // verification for in-memory hits - all default off. See BlockCache::Config.
+  virtual void setChecksumOffloadBatchReclaim(bool enable) = 0;
+  virtual void setChecksumOffloadBatch(bool enable) = 0;
+  virtual void setChecksumDeferSmall(bool enable) = 0;
+  virtual void setSkipInMemValueVerify(bool enable) = 0;
+
   // set*EvictionPolicy function family: sets eviction policy. Supports LRU,
   // LRU with deferred insert and FIFO. Must set up one of them.
 
@@ -97,6 +115,8 @@ class BlockCacheProto {
 
   // (Optional) Set if direct flush without intermediate copy is enabled.
   virtual void setDirectFlush(bool enable) = 0;
+  // Copy the region buffer into the flush write buffer on Intel DSA
+  virtual void setFlushCopyOffload(bool enable) = 0;
 
   // (Optional) Set if the combined entry block is enabled.
   virtual void setUseCombinedEntryBlock(bool useCombinedEntryBlock) = 0;
@@ -135,6 +155,10 @@ class BigHashProto {
   // (Optional) Set number of mutexes for bucket locking as power of 2.
   // numMutexes = 1 << numMutexesPower. Default: 14 (16K mutexes)
   virtual void setNumMutexesPower(uint8_t numMutexesPower) = 0;
+
+  // (Optional) Offload bucket checksumming to Intel DSA. Requires a build
+  // with DTO support.
+  virtual void setChecksumOffload(bool enable) = 0;
 };
 
 class EnginePairProto {

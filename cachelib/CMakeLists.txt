@@ -44,6 +44,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_TESTS "If enabled, compile the tests." ON)
 
+option(BUILD_WITH_DTO
+  "If enabled, build with the DTO library for Intel DSA offload support." OFF)
+
 
 set(BIN_INSTALL_DIR bin CACHE STRING
     "The subdirectory where binaries should be installed")
@@ -311,6 +314,58 @@ endfunction()
 
 add_thrift_file(OBJECT_CACHE_PERSISTENCE
                 object_cache/persistence/persistent_data.thrift json)
+
+if (BUILD_WITH_DTO)
+  # DSA offload runtime (DTO, https://github.com/intel/DTO). Resolved here so
+  # every cachelib library can use it: DTO::dto_explicit is linked PUBLIC into
+  # cachelib_common (see common/CMakeLists.txt), the base library of every
+  # other cachelib target, which propagates the headers, the link dependency,
+  # and the CACHELIB_BUILD_WITH_DTO compile definition to the whole tree and
+  # to consumers of the installed package.
+  #
+  # The DSA checksum offload code uses DTO's explicit asynchronous API
+  # (caller-allocated submit/poll operations, batches, raw CRC32C), which
+  # exists from DTO 1.2 on. An installed DTO package of at least that version
+  # is used when present; otherwise the pinned release is fetched and built
+  # in-tree rather than linking whatever libdto happens to be on the system.
+  set(CACHELIB_DTO_GIT_REPOSITORY "https://github.com/intel/DTO.git"
+      CACHE STRING "Git repository for DTO when no installed copy is found")
+  # Tag v1.2.
+  set(CACHELIB_DTO_GIT_TAG "6ef831d9204f9156b1e816c7b603e7f0718193ce"
+      CACHE STRING "DTO revision to fetch when no installed copy is found")
+
+  find_package(DTO 1.2 CONFIG QUIET)
+  if (DTO_FOUND)
+    message(STATUS "Using installed DTO package: ${DTO_DIR} "
+      "(version ${DTO_VERSION})")
+  else()
+    if (CMAKE_VERSION VERSION_LESS 3.14)
+      message(FATAL_ERROR
+        "BUILD_WITH_DTO needs an installed DTO cmake package or "
+        "CMake >= 3.14 to fetch one. Install DTO from "
+        "${CACHELIB_DTO_GIT_REPOSITORY} at ${CACHELIB_DTO_GIT_TAG}, "
+        "or upgrade CMake.")
+    endif()
+    # DTO links against libaccel-config and libnuma; check for them here so
+    # a missing system package fails at configure time with a clear message
+    # instead of at link time inside the fetched project.
+    find_library(ACCEL_CONFIG_LIBRARY accel-config)
+    find_library(NUMA_LIBRARY numa)
+    if (NOT ACCEL_CONFIG_LIBRARY OR NOT NUMA_LIBRARY)
+      message(FATAL_ERROR
+        "BUILD_WITH_DTO requires the libaccel-config and libnuma "
+        "development packages (e.g. apt install libaccel-config-dev "
+        "libnuma-dev)")
+    endif()
+    message(STATUS "DTO not installed; fetching "
+      "${CACHELIB_DTO_GIT_REPOSITORY} @ ${CACHELIB_DTO_GIT_TAG}")
+    include(FetchContent)
+    FetchContent_Declare(dto
+      GIT_REPOSITORY "${CACHELIB_DTO_GIT_REPOSITORY}"
+      GIT_TAG "${CACHELIB_DTO_GIT_TAG}")
+    FetchContent_MakeAvailable(dto)
+  endif()
+endif()
 
 add_subdirectory (common)
 add_subdirectory (shm)

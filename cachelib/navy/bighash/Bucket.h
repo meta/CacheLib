@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <folly/Function.h>
 #include <folly/Portability.h>
 
 #include "cachelib/navy/bighash/BucketStorage.h"
@@ -69,6 +70,12 @@ class FOLLY_PACK_ATTR Bucket {
 
   // User will pass in a view that contains the memory that is a Bucket
   static uint32_t computeChecksum(BufferView view);
+
+  // Same checksum, but computed by DSA (when built with DTO support) with
+  // @overlap CPU work running while the accelerator operates. @overlap may
+  // read the bucket but must not modify it.
+  static uint32_t computeChecksumOffloaded(BufferView view,
+                                           folly::FunctionRef<void()> overlap);
 
   // Initialize a brand new Bucket given a piece of memory in the case
   // that the existing bucket is invalid. (I.e. checksum or generation

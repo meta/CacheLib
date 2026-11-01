@@ -32,6 +32,9 @@
 #include "cachelib/navy/block_cache/HitsReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/PercentageReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/SparseMapIndex.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
+
+#include <cstring>
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/common/Types.h"
 #include "folly/Range.h"
@@ -106,6 +109,11 @@ BlockCache::Config& BlockCache::Config::validate() {
       throw std::invalid_argument(
           "Each priority must have at least one allocator");
     }
+  }
+
+  if (checksumOffload && !checksum) {
+    throw std::invalid_argument(
+        "checksum offload requires data checksum to be enabled");
   }
 
   reinsertionConfig.validate();
@@ -225,6 +233,21 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
       checkExpired_{std::move(config.checkExpired)},
       destructorCb_{std::move(config.destructorCb)},
       checksumData_{config.checksum},
+      checksumOffload_{config.checksumOffload},
+      checksumOffloadMinSize_{config.checksumOffloadMinSize},
+      checksumOffloadReadMinSize_{config.checksumOffloadReadMinSize
+                                      ? config.checksumOffloadReadMinSize
+                                      : config.checksumOffloadMinSize},
+      checksumOffloadCacheControl_{config.checksumOffloadCacheControl},
+      checksumOffloadBatchReclaim_{config.checksumOffload &&
+                                   config.checksumOffloadBatchReclaim},
+      checksumOffloadBatch_{config.checksumOffload &&
+                            config.checksumOffloadBatch},
+      checksumDeferSmall_{config.checksum && config.checksumOffload &&
+                          config.checksumDeferSmall},
+      skipInMemValueVerify_{config.skipInMemValueVerify ||
+                            (config.checksum && config.checksumOffload &&
+                             config.checksumDeferSmall)},
       device_{*config.device},
       allocAlignSize_{calcAllocAlignSize()},
       readBufferSize_{config.readBufferSize < kDefReadBufferSize
@@ -254,7 +277,8 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
                      config.regionManagerFlushAsync,
                      true /* allowReadDuringReclaim */,
                      config.recoverEvictionPolicy,
-                     config.directFlush},
+                     config.directFlush,
+                     config.flushCopyOffload},
       allocator_{regionManager_, config.allocatorsPerPriority},
       reinsertionPolicy_{makeReinsertionPolicy(config.reinsertionConfig)} {
   validate(config);
@@ -276,6 +300,15 @@ std::shared_ptr<BlockCacheReinsertionPolicy> BlockCache::makeReinsertionPolicy(
     return std::make_shared<PercentageReinsertionPolicy>(pctThreshold);
   }
   return reinsertionConfig.getCustomPolicy(*index_);
+}
+
+uint32_t BlockCache::valueChecksum(BufferView value) const {
+  if (checksumOffload_ && value.size() >= checksumOffloadReadMinSize_) {
+    // While DSA computes the checksum, the calling fiber yields (or the
+    // thread pause-polls), freeing the reader for other requests.
+    return checksumWithOverlap(value, [] {});
+  }
+  return checksum(value);
 }
 
 uint32_t BlockCache::serializedSize(uint32_t keySize,
@@ -303,7 +336,7 @@ Status BlockCache::insert(HashedKey hk,
 
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
-  writeEntry(bufferView, hk, value, false, lastAccessTimeSecs);
+  writeEntry(bufferView, addr, hk, value, false, lastAccessTimeSecs);
   updateIndex(hk.keyHash(), slotSize, addr, /* allowReplace */ true);
   allocator_.close(std::move(desc));
   INJECT_PAUSE(pause_blockcache_insert_done);
@@ -522,6 +555,7 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     return std::make_pair(Status::NotFound, "");
   }
 
+  const bool inMemRead = !rdesc.isPhysReadMode();
   auto buffer = regionManager_.read(rdesc, RelAddress{rid, 0}, offset);
   // The region had been read out to Buffer, so can be closed here
   regionManager_.close(std::move(rdesc));
@@ -561,21 +595,24 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     }
 
     BufferView valueView{desc.valueSize, entryEnd - entrySize};
-    if (checksumData_ && desc.cs != checksum(valueView)) {
-      XLOGF(ERR,
-            "Item value checksum mismatch in getRandomAlloc(). Region {} is "
-            "likely corrupted. Expected: {}, Actual: {}, Offset: {}, "
-            "Physical-offset: {}, Value-size: {}, Payload (hex): {}",
-            rid.index(),
-            desc.cs,
-            checksum(valueView),
-            addrEnd.offset() - entrySize,
-            regionManager_.physicalOffset(addrEnd) - entrySize,
-            desc.valueSize,
-            // call folly::unhexlify to convert it back to binary data
-            folly::hexlify(
-                folly::ByteRange(valueView.data(), valueView.dataEnd())));
-      break;
+    if (checksumData_ && !(skipInMemValueVerify_ && inMemRead)) {
+      const uint32_t valueCs = valueChecksum(valueView);
+      if (desc.cs != valueCs) {
+        XLOGF(ERR,
+              "Item value checksum mismatch in getRandomAlloc(). Region {} is "
+              "likely corrupted. Expected: {}, Actual: {}, Offset: {}, "
+              "Physical-offset: {}, Value-size: {}, Payload (hex): {}",
+              rid.index(),
+              desc.cs,
+              valueCs,
+              addrEnd.offset() - entrySize,
+              regionManager_.physicalOffset(addrEnd) - entrySize,
+              desc.valueSize,
+              // call folly::unhexlify to convert it back to binary data
+              folly::hexlify(
+                  folly::ByteRange(valueView.data(), valueView.dataEnd())));
+        break;
+      }
     }
 
     // confirm that the chosen NvmItem is still being mapped with the key
@@ -674,10 +711,62 @@ Status BlockCache::remove(HashedKey hk) {
  *
  * See @RegionEvictCallback for further details.
  */
+std::vector<uint32_t> BlockCache::checksumValues(
+    const std::vector<BufferView>& values) const {
+  std::vector<uint32_t> out(values.size());
+  if (!checksumOffloadBatchReclaim_) {
+    for (size_t i = 0; i < values.size(); ++i) {
+      out[i] = valueChecksum(values[i]);
+    }
+    return out;
+  }
+  // Below the read gate the CPU is cheaper than a descriptor; the rest go to
+  // the device in batches of up to kMax (one submit, one completion each).
+  BatchChecksumOp op;
+  std::vector<size_t> members;
+  members.reserve(BatchChecksumOp::kMax);
+  auto flush = [&] {
+    op.submit();
+    op.wait();
+    for (size_t j = 0; j < members.size(); ++j) {
+      out[members[j]] = op.crc(j);
+    }
+    members.clear();
+    op.reset();
+  };
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (values[i].size() < checksumOffloadReadMinSize_ || values[i].size() == 0) {
+      out[i] = checksum(values[i]);
+      continue;
+    }
+    op.addChecksum(values[i]);
+    members.push_back(i);
+    if (op.full()) {
+      flush();
+    }
+  }
+  if (!members.empty()) {
+    flush();
+  }
+  return out;
+}
+
 uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
   uint32_t evictionCount = 0;
   auto& region = regionManager_.getRegion(rid);
   auto offset = region.getLastEntryEndOffset();
+  // Pass 1: walk the entries (header checksums) and collect them; pass 2:
+  // checksum all values at once (batched on DSA when configured); pass 3:
+  // reinsert/evict each. The per-entry order and semantics are unchanged;
+  // a header checksum failure still stops at that entry.
+  struct Entry {
+    uint32_t offset;
+    uint32_t entrySize;
+    EntryDesc desc;
+    BufferView value;
+  };
+  std::vector<Entry> entries;
+  std::vector<BufferView> values;
   while (offset > 0) {
     RelAddress addrEnd(rid, offset);
     auto entryEnd = buffer.data() + offset;
@@ -711,12 +800,30 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
      * (value starts here)
      */
     const auto entrySize = serializedSize(desc.keySize, desc.valueSize);
+    BufferView value{desc.valueSize, entryEnd - entrySize};
+    entries.push_back(Entry{offset, static_cast<uint32_t>(entrySize), desc, value});
+    values.push_back(value);
+    XDCHECK_GE(offset, entrySize);
+    offset -= entrySize;
+  }
+
+  std::vector<uint32_t> valueCs;
+  if (checksumData_) {
+    valueCs = checksumValues(values);
+  }
+
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& e = entries[i];
+    const auto entryEnd = buffer.data() + e.offset;
+    const auto entrySize = e.entrySize;
+    const auto& desc = e.desc;
     HashedKey hk =
         makeHK(entryEnd - sizeof(EntryDesc) - desc.keySize, desc.keySize);
-    BufferView value{desc.valueSize, entryEnd - entrySize};
+    BufferView value = e.value;
 
     AllocatorApiResult reinsertionRes = reinsertOrRemoveItem(
-        hk, value, entrySize, RelAddress{rid, offset}, desc);
+        hk, value, entrySize, RelAddress{rid, e.offset}, desc,
+        checksumData_ ? std::optional<uint32_t>{valueCs[i]} : std::nullopt);
     switch (reinsertionRes) {
     case AllocatorApiResult::EVICTED:
     case AllocatorApiResult::EXPIRED:
@@ -736,8 +843,6 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
       recordEvent(hk.key(), AllocatorApiEvent::NVM_EVICT, reinsertionRes,
                   entrySize);
     }
-    XDCHECK_GE(offset, entrySize);
-    offset -= entrySize;
   }
 
   XDCHECK_GE(region.getNumItems(), evictionCount);
@@ -748,6 +853,14 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
   uint32_t evictionCount = 0; // item that was evicted during cleanup
   auto& region = regionManager_.getRegion(rid);
   auto offset = region.getLastEntryEndOffset();
+  struct Entry {
+    uint32_t offset;
+    uint32_t entrySize;
+    EntryDesc desc;
+    BufferView value;
+  };
+  std::vector<Entry> entries;
+  std::vector<BufferView> values;
   while (offset > 0) {
     // iterate each entry
     auto entryEnd = buffer.data() + offset;
@@ -771,10 +884,28 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     }
 
     const auto entrySize = serializedSize(desc.keySize, desc.valueSize);
+    BufferView value{desc.valueSize, entryEnd - entrySize};
+    entries.push_back(Entry{offset, static_cast<uint32_t>(entrySize), desc, value});
+    values.push_back(value);
+    XDCHECK_GE(offset, entrySize);
+    offset -= entrySize;
+  }
+
+  std::vector<uint32_t> valueCs;
+  if (checksumData_) {
+    valueCs = checksumValues(values);
+  }
+
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& e = entries[i];
+    const auto entryEnd = buffer.data() + e.offset;
+    const auto entrySize = e.entrySize;
+    const auto& desc = e.desc;
+    const auto offset = e.offset;
     HashedKey hk =
         makeHK(entryEnd - sizeof(EntryDesc) - desc.keySize, desc.keySize);
-    BufferView value{desc.valueSize, entryEnd - entrySize};
-    if (checksumData_ && desc.cs != checksum(value)) {
+    BufferView value = e.value;
+    if (checksumData_ && desc.cs != valueCs[i]) {
       // We do not need to abort here since the EntryDesc checksum was good, so
       // we can safely proceed to read the next entry.
       cleanupValueChecksumErrorCount_.inc();
@@ -791,8 +922,6 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     if (destructorCb_ && removeRes) {
       destructorCb_(hk, value, DestructorEvent::Recycled);
     }
-    XDCHECK_GE(offset, entrySize);
-    offset -= entrySize;
   }
 
   XDCHECK_GE(region.getNumItems(), evictionCount);
@@ -929,7 +1058,7 @@ Status BlockCache::onWriteCombinedEntryBlock(uint64_t stream,
     return Status::Retry;
   }
 
-  writeEntry(bufView, std::nullopt, ceb.getBufferView(),
+  writeEntry(bufView, addr, std::nullopt, ceb.getBufferView(),
              true /* combinedEntry */);
 
   // Need to update the index for all the entries in combined entry block
@@ -981,6 +1110,7 @@ Status BlockCache::onReadCombinedEntryBlock(uint32_t address,
   // key info will be within the value itself
   uint32_t size = serializedSize(0, readSize);
 
+  const bool inMemRead = !desc.isPhysReadMode();
   auto buffer = regionManager_.read(desc, addrEnd.sub((uint32_t)size), size);
   regionManager_.close(std::move(desc));
 
@@ -1025,21 +1155,24 @@ Status BlockCache::onReadCombinedEntryBlock(uint32_t address,
     return Status::NotFound;
   }
 
-  // Check the checksum for the value
-  if (checksumData_ && entryDesc.cs != checksum(BufferView(entryDesc.valueSize,
-                                                           buffer.data()))) {
-    XLOGF(ERR,
-          "Item value checksum mismatch in onReadCombinedEntryBlock(). "
-          "Region {} is likely corrupted. Expected: {}, Actual: {}, Offset: "
-          "{}, Physical-offset: {}, "
-          "Value-size: {} Payload (hex): {}",
-          addrEnd.rid().index(), entryDesc.cs,
-          checksum(BufferView(entryDesc.valueSize, buffer.data())),
-          addrEnd.offset() - size,
-          regionManager_.physicalOffset(addrEnd) - size, entryDesc.valueSize,
-          folly::hexlify(folly::ByteRange(
-              buffer.data(), buffer.data() + entryDesc.valueSize)));
-    return Status::ChecksumError;
+  // Check the checksum for the value (skipped for in-memory reads when
+  // skipInMemValueVerify_, see Config)
+  if (checksumData_ && !(skipInMemValueVerify_ && inMemRead)) {
+    const uint32_t cebValueCs =
+        valueChecksum(BufferView(entryDesc.valueSize, buffer.data()));
+    if (entryDesc.cs != cebValueCs) {
+      XLOGF(ERR,
+            "Item value checksum mismatch in onReadCombinedEntryBlock(). "
+            "Region {} is likely corrupted. Expected: {}, Actual: {}, Offset: "
+            "{}, Physical-offset: {}, "
+            "Value-size: {} Payload (hex): {}",
+            addrEnd.rid().index(), entryDesc.cs, cebValueCs,
+            addrEnd.offset() - size,
+            regionManager_.physicalOffset(addrEnd) - size, entryDesc.valueSize,
+            folly::hexlify(folly::ByteRange(
+                buffer.data(), buffer.data() + entryDesc.valueSize)));
+      return Status::ChecksumError;
+    }
   }
 
   // shrink and set it as CEB's buffer
@@ -1145,7 +1278,8 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
     BufferView value,
     uint32_t entrySize,
     RelAddress currAddr,
-    const EntryDesc& entryDesc) {
+    const EntryDesc& entryDesc,
+    std::optional<uint32_t> valueCs) {
   // Remove the key from index and return the correct result.
   auto removeItem = [this, hk, currAddr](bool expired) {
     if (index_->removeIfMatch(hk.keyHash(), encodeRelAddress(currAddr))) {
@@ -1191,23 +1325,27 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
   }
 
   // Validate checksum as we want to reinsert the item
-  if (checksumData_ && entryDesc.cs != checksum(value)) {
-    // We do not need to abort here since the EntryDesc checksum was good, so
-    // we can safely proceed to read the next entry.
-    XLOGF(ERR,
-          "Item value checksum mismatch in reinsertOrRemoveItem(). "
-          "Item is likely corrupted. Item will not be reinserted. "
-          "We will continue evaluating remaining items in the region."
-          "Expected: {}, Actual: {}, Value-size: {}, Payload (hex): {}",
-          entryDesc.cs,
-          checksum(value),
-          entryDesc.valueSize,
-          folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
-    reclaimValueChecksumErrorCount_.inc();
-    removeItem(false);
-    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
-                AllocatorApiResult::CORRUPTED, entrySize);
-    return AllocatorApiResult::CORRUPTED;
+  if (checksumData_) {
+    const uint32_t reinsertValueCs =
+        valueCs ? *valueCs : valueChecksum(value);
+    if (entryDesc.cs != reinsertValueCs) {
+      // We do not need to abort here since the EntryDesc checksum was good, so
+      // we can safely proceed to read the next entry.
+      XLOGF(ERR,
+            "Item value checksum mismatch in reinsertOrRemoveItem(). "
+            "Item is likely corrupted. Item will not be reinserted. "
+            "We will continue evaluating remaining items in the region."
+            "Expected: {}, Actual: {}, Value-size: {}, Payload (hex): {}",
+            entryDesc.cs,
+            reinsertValueCs,
+            entryDesc.valueSize,
+            folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
+      reclaimValueChecksumErrorCount_.inc();
+      removeItem(false);
+      recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                  AllocatorApiResult::CORRUPTED, entrySize);
+      return AllocatorApiResult::CORRUPTED;
+    }
   }
 
   // Priority of an re-inserted item is determined by its past accesses
@@ -1246,7 +1384,7 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
 
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
-  writeEntry(bufferView, hk, value, false);
+  writeEntry(bufferView, addr, hk, value, false);
   const auto replaced = index_->replaceIfMatch(hk.keyHash(),
                                                encodeRelAddress(addr.add(size)),
                                                encodeRelAddress(currAddr));
@@ -1323,6 +1461,7 @@ folly::Expected<BlockCache::AllocData, Status> BlockCache::allocateForInsert(
 }
 
 void BlockCache::writeEntry(MutableBufferView buffer,
+                            RelAddress addr,
                             std::optional<HashedKey> hk,
                             BufferView value,
                             bool combinedEntry,
@@ -1338,20 +1477,66 @@ void BlockCache::writeEntry(MutableBufferView buffer,
 
   // Copy descriptor and the key to the end
   uint8_t* dest = buffer.data() + buffer.size() - sizeof(EntryDesc);
-  auto desc = new (dest) EntryDesc(static_cast<uint32_t>(keySize),
-                                   static_cast<uint32_t>(value.size()), keyHash,
-                                   lastAccessTimeSecs);
+  EntryDesc* desc = nullptr;
 
-  if (checksumData_) {
-    desc->cs = checksum(value);
-  }
+  // Constructs the entry descriptor (which computes its own header checksum
+  // over the fields preceding csSelf) and copies the key in front of it. The
+  // value area at the head of the buffer is not touched, so this can overlap
+  // with the value copy.
+  auto writeDescAndKey = [&] {
+    desc = new (dest) EntryDesc(static_cast<uint32_t>(keySize),
+                                static_cast<uint32_t>(value.size()), keyHash,
+                                lastAccessTimeSecs);
+    if (!combinedEntry) {
+      // Key info will be inside the value itself for combined entry block
+      std::memcpy(dest - keySize, hk->key().data(), keySize);
+      logicalWriteSize = keySize + value.size();
+    }
+  };
 
-  if (!combinedEntry) {
-    // Key info will be inside the value itself for combined entry block
-    std::memcpy(dest - keySize, hk->key().data(), keySize);
-    logicalWriteSize = keySize + value.size();
+  if (checksumData_ && checksumOffload_ &&
+      value.size() >= checksumOffloadMinSize_) {
+    // Fused copy + checksum on DSA. The descriptor and key are written by the
+    // CPU BEFORE the descriptor is submitted rather than overlapped with it:
+    // they sit at the tail of the same slot the device writes the value into,
+    // and when value.size() is not a multiple of a cache line the CPU and the
+    // device would otherwise store into the same line concurrently (correct
+    // under coherence, but a false-sharing round trip per insert). The work
+    // is ~100 ns, so nothing measurable is lost. The value checksum is not
+    // covered by csSelf, so it can be filled in afterwards.
+    writeDescAndKey();
+    const uint32_t cs =
+        checksumOffloadBatch_
+            ? copyAndChecksumBatched(buffer.data(), value, [] {},
+                                     checksumOffloadCacheControl_)
+            : copyAndChecksum(buffer.data(), value, [] {},
+                              checksumOffloadCacheControl_);
+    desc->cs = cs;
+  } else if (checksumDeferSmall_ && value.size() > 0) {
+    // Below the per-op gate: copy now, checksum at region flush in a DSA
+    // batch with the region's other small values (RegionManager::
+    // drainPendingChecksums patches desc->cs then). Lookups served from the
+    // in-memory buffer do not verify the value checksum, so 0 is fine until
+    // the flush; everything that reads the region back from the device
+    // sees the patched value.
+    writeDescAndKey();
+    std::memcpy(buffer.data(), value.data(), value.size());
+    desc->cs = 0;
+    const auto csOffset = static_cast<uint32_t>(
+        addr.offset() +
+        (reinterpret_cast<const uint8_t*>(&desc->cs) - buffer.data()));
+    regionManager_.addPendingChecksum(
+        addr.rid(),
+        Region::PendingChecksum{addr.offset(),
+                                static_cast<uint32_t>(value.size()),
+                                csOffset});
+  } else {
+    writeDescAndKey();
+    if (checksumData_) {
+      desc->cs = checksum(value);
+    }
+    std::memcpy(buffer.data(), value.data(), value.size());
   }
-  std::memcpy(buffer.data(), value.data(), value.size());
 
   logicalWrittenCount_.add(logicalWriteSize);
   serializedWrittenCount_.add(buffer.size());
@@ -1437,20 +1622,28 @@ void BlockCache::readEntry(RegionDescriptor& regionDesc,
   ld.valueSize_ = desc.valueSize;
   ld.lastAccessTimeSecs_ = desc.lastAccessTimeSecs;
   auto slice = ld.buffer_.view().slice(0, desc.valueSize);
-  if (checksumData_ && desc.cs != checksum(slice)) {
-    XLOG_N_PER_MS(ERR, 10, 10'000) << fmt::format(
-        "Item value checksum mismatch in readEntry() looking up key {} in "
-        "Region {}. Expected: {}, Actual: {}, Offset: {}, Physical-offset: {}, "
-        "Value-size: {} Payload (hex): {}",
-        key, addrEnd.rid().index(), desc.cs, checksum(slice),
-        addrEnd.offset() - size, regionManager_.physicalOffset(addrEnd) - size,
-        slice.size(),
-        folly::hexlify(
-            folly::ByteRange(slice.data(), slice.data() + slice.size())));
-    ld.buffer_.reset();
-    lookupValueChecksumErrorCount_.inc();
-    ld.status_ = Status::ChecksumError;
-    return;
+  // An entry still in the in-memory region buffer never left DRAM and the
+  // header checksum above still covers the descriptor; with
+  // skipInMemValueVerify_ (implied by deferred checksums, whose cs is only
+  // patched at flush) the value is not verified until it is read back.
+  if (checksumData_ &&
+      !(skipInMemValueVerify_ && !regionDesc.isPhysReadMode())) {
+    const uint32_t sliceCs = valueChecksum(slice);
+    if (desc.cs != sliceCs) {
+      XLOG_N_PER_MS(ERR, 10, 10'000) << fmt::format(
+          "Item value checksum mismatch in readEntry() looking up key {} in "
+          "Region {}. Expected: {}, Actual: {}, Offset: {}, Physical-offset: "
+          "{}, Value-size: {} Payload (hex): {}",
+          key, addrEnd.rid().index(), desc.cs, sliceCs,
+          addrEnd.offset() - size,
+          regionManager_.physicalOffset(addrEnd) - size, slice.size(),
+          folly::hexlify(
+              folly::ByteRange(slice.data(), slice.data() + slice.size())));
+      ld.buffer_.reset();
+      lookupValueChecksumErrorCount_.inc();
+      ld.status_ = Status::ChecksumError;
+      return;
+    }
   }
   ld.status_ = Status::Ok;
 }

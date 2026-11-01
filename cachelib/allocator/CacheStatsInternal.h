@@ -141,6 +141,12 @@ struct Stats {
   // attempts made from nvm cache to allocate an item for promotion
   TLCounter numNvmAllocAttempts{0};
 
+  // flash-hit copy-outs (Navy buffer -> DRAM item) performed by Intel DSA,
+  // the bytes they moved, and offload attempts that fell back to the CPU
+  TLCounter numNvmCopyOutOffloaded{0};
+  TLCounter numNvmCopyOutOffloadedBytes{0};
+  TLCounter numNvmCopyOutFallbacks{0};
+
   // attempts made from nvm cache to allocate an item for its destructor
   TLCounter numNvmAllocForItemDestructor{0};
   // heap allocate errors for item destructor

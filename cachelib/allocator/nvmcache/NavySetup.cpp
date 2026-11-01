@@ -140,6 +140,8 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
   // Set number of mutexes from config
   bigHash->setNumMutexesPower(bigHashConfig.getNumMutexesPower());
 
+  bigHash->setChecksumOffload(bigHashConfig.getChecksumOffload());
+
   proto.setBigHash(std::move(bigHash), bigHashConfig.getSmallItemMaxSize());
 
   if (bigHashCacheOffset <= bigHashStartOffsetLimit) {
@@ -196,6 +198,18 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   auto blockCache = cachelib::navy::createBlockCacheProto();
   blockCache->setLayout(blockCacheOffset, blockCacheSize, regionSize);
   blockCache->setChecksum(blockCacheConfig.getDataChecksum());
+  blockCache->setChecksumOffload(blockCacheConfig.getChecksumOffload(),
+                                 blockCacheConfig.getChecksumOffloadMinSize());
+  blockCache->setChecksumOffloadReadMinSize(
+      blockCacheConfig.getChecksumOffloadReadMinSize());
+  blockCache->setChecksumOffloadCacheControl(
+      blockCacheConfig.getChecksumOffloadCacheControl());
+  blockCache->setChecksumOffloadBatchReclaim(
+      blockCacheConfig.getChecksumOffloadBatchReclaim());
+  blockCache->setChecksumOffloadBatch(blockCacheConfig.getChecksumOffloadBatch());
+  blockCache->setChecksumDeferSmall(blockCacheConfig.getChecksumDeferSmall());
+  blockCache->setSkipInMemValueVerify(
+      blockCacheConfig.getSkipInMemValueVerify());
 
   // set eviction policy
   auto segmentRatio = blockCacheConfig.getSFifoSegmentRatio();
@@ -214,6 +228,7 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   blockCache->setRecoverEvictionPolicy(
       blockCacheConfig.isRecoverEvictionPolicy());
   blockCache->setDirectFlush(blockCacheConfig.isDirectFlush());
+  blockCache->setFlushCopyOffload(blockCacheConfig.isFlushCopyOffload());
   blockCache->setUseCombinedEntryBlock(
       blockCacheConfig.isCombinedEntryBlockEnabled());
   blockCache->setNumAllocatorsPerPriority(
