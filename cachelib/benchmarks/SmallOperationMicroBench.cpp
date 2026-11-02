@@ -39,6 +39,7 @@ clang-format on
 */
 
 #include <fmt/core.h>
+#include <fmt/format.h>
 #include <folly/Benchmark.h>
 #include <folly/BenchmarkUtil.h>
 #include <folly/init/Init.h>
