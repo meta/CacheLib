@@ -20,6 +20,7 @@
 #include <folly/json/dynamic.h>
 #include <folly/logging/xlog.h>
 
+#include <map>
 #include <stdexcept>
 
 #include "cachelib/allocator/nvmcache/BlockCacheReinsertionPolicy.h"

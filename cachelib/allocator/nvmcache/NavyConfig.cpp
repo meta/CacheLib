@@ -17,7 +17,9 @@
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
 
 #include <fmt/format.h>
+#include <folly/String.h>
 
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
