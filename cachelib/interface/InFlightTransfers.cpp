@@ -18,6 +18,7 @@
 
 #include <folly/Utility.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
+#include <folly/coro/Baton.h>
 
 #include <functional>
 #include <string>
@@ -38,20 +39,16 @@ struct InFlightTransfers::State {
 struct InFlightTransfers::Entry {
   Entry(std::shared_ptr<State> state, std::string key)
       : state_(std::move(state)), key_(std::move(key)) {}
+  ~Entry() = default;
   Entry(const Entry&) = delete;
   Entry& operator=(const Entry&) = delete;
   Entry(Entry&&) = delete;
   Entry& operator=(Entry&&) = delete;
 
-  ~Entry() {
-    // A new transfer may have replaced this expired registration already.
-    state_->entries_.erase_key_if(
-        key_, [](const auto& current) { return current.expired(); });
-  }
-
   std::shared_ptr<State> state_;
   std::string key_;
   folly::CancellationSource cancellation_;
+  folly::coro::Baton finished_;
 };
 
 InFlightTransfers::InFlightTransfers() : state_(std::make_shared<State>()) {}
@@ -59,6 +56,31 @@ InFlightTransfers::InFlightTransfers() : state_(std::make_shared<State>()) {}
 InFlightTransfers::TransferToken::TransferToken(
     std::shared_ptr<Entry> entry) noexcept
     : entry_(std::move(entry)) {}
+
+InFlightTransfers::TransferToken::~TransferToken() { finish(); }
+
+InFlightTransfers::TransferToken& InFlightTransfers::TransferToken::operator=(
+    TransferToken&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  TransferToken previous{std::move(*this)};
+  entry_ = std::move(other.entry_);
+  return *this;
+}
+
+void InFlightTransfers::TransferToken::finish() noexcept {
+  auto entry = std::move(entry_);
+  if (!entry) {
+    return;
+  }
+  entry->state_->entries_.erase_key_if(
+      entry->key_, [&entry](const auto& current) {
+        return !current.owner_before(entry) && !entry.owner_before(current);
+      });
+  // Keep the baton alive across inline waiter resumption, outside map locks.
+  entry->finished_.post();
+}
 
 folly::CancellationToken
 InFlightTransfers::TransferToken::getCancellationToken() const noexcept {
@@ -78,19 +100,31 @@ InFlightTransfers::tryAcquireTransferToken(Key key) {
   return TransferToken{std::move(entry)};
 }
 
+std::shared_ptr<InFlightTransfers::Entry> InFlightTransfers::findEntry(
+    Key key) const {
+  auto it = state_->entries_.find(std::string_view{key.data(), key.size()});
+  return it == state_->entries_.end() ? nullptr : it->second.lock();
+}
+
 void InFlightTransfers::cancel(Key key) {
-  auto cancellation = folly::CancellationSource::invalid();
-  {
-    auto it = state_->entries_.find(std::string_view{key.data(), key.size()});
-    if (it != state_->entries_.end()) {
-      if (auto entry = it->second.lock()) {
-        cancellation = entry->cancellation_;
-      }
-    }
+  if (auto entry = findEntry(key)) {
+    entry->cancellation_.requestCancellation();
   }
-  // Run callbacks after dropping our temporary shared_ptr<Entry>, so they can
-  // release the transfer token and register a replacement for the same key.
-  cancellation.requestCancellation();
+}
+
+folly::coro::Task<void> InFlightTransfers::cancelAndWait(Key key) {
+  auto entry = findEntry(key);
+  if (entry) {
+    entry->cancellation_.requestCancellation();
+  }
+  return waitForCompletion(std::move(entry));
+}
+
+folly::coro::Task<void> InFlightTransfers::waitForCompletion(
+    std::shared_ptr<Entry> entry) {
+  if (entry) {
+    co_await entry->finished_;
+  }
 }
 
 } // namespace facebook::cachelib::interface

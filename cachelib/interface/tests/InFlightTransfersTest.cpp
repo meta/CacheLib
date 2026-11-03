@@ -15,12 +15,16 @@
  */
 
 #include <folly/CancellationToken.h>
+#include <folly/coro/GtestHelpers.h>
+#include <folly/coro/WithCancellation.h>
+#include <folly/executors/ManualExecutor.h>
 #include <gtest/gtest.h>
 
 #include <array>
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -156,4 +160,126 @@ TEST(InFlightTransfersTest, ConcurrentAcquisitionHasOneWinner) {
     result.reset();
   }
   EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+CO_TEST(InFlightTransfersTest, WaitForMissingOrReleasedTransferCompletes) {
+  InFlightTransfers transfers;
+  co_await transfers.cancelAndWait("missing");
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  transfer.reset();
+  co_await transfers.cancelAndWait("key");
+}
+
+TEST(InFlightTransfersTest, MultipleWaitersResumeWhenOwnerReleases) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  auto first =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("key"))
+          .start();
+  auto second =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("key"))
+          .start();
+  executor.drain();
+  EXPECT_TRUE(transfer->getCancellationToken().isCancellationRequested());
+  EXPECT_FALSE(first.isReady());
+  EXPECT_FALSE(second.isReady());
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  transfer.reset();
+  executor.drain();
+  ASSERT_TRUE(first.isReady());
+  ASSERT_TRUE(second.isReady());
+  std::move(first).get();
+  std::move(second).get();
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest, MoveAssignmentCompletesOnlyReplacedTransfer) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto first = transfers.tryAcquireTransferToken("first");
+  auto second = transfers.tryAcquireTransferToken("second");
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  auto firstWait =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("first"))
+          .start();
+  auto secondWait =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("second"))
+          .start();
+  executor.drain();
+  auto moved = std::move(*second);
+  second.reset();
+  executor.drain();
+  EXPECT_FALSE(secondWait.isReady());
+  *first = std::move(moved);
+  executor.drain();
+  ASSERT_TRUE(firstWait.isReady());
+  std::move(firstWait).get();
+  EXPECT_FALSE(secondWait.isReady());
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("first"));
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("second"));
+  first.reset();
+  executor.drain();
+  ASSERT_TRUE(secondWait.isReady());
+  std::move(secondWait).get();
+}
+
+CO_TEST(InFlightTransfersTest, DeferredWaitDoesNotRetainOrCancelReplacement) {
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  auto wait = transfers.cancelAndWait("key");
+  EXPECT_TRUE(transfer->getCancellationToken().isCancellationRequested());
+  transfer.reset();
+  auto replacement = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(replacement);
+  co_await std::move(wait);
+  EXPECT_FALSE(replacement->getCancellationToken().isCancellationRequested());
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+}
+
+CO_TEST(InFlightTransfersTest, WaitSurvivesRegistryAndKeyDestruction) {
+  auto transfers = std::make_unique<InFlightTransfers>();
+  auto transfer = transfers->tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  auto wait = transfers->cancelAndWait(std::string{"key"});
+  transfers.reset();
+  transfer.reset();
+  co_await std::move(wait);
+}
+
+CO_TEST(InFlightTransfersTest, CancellationCallbackCanFinishBeforeWaitStarts) {
+  auto transfers = std::make_unique<InFlightTransfers>();
+  auto transfer = transfers->tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  folly::CancellationCallback callback{transfer->getCancellationToken(), [&] {
+                                         transfer.reset();
+                                         transfers.reset();
+                                       }};
+  auto wait = transfers->cancelAndWait("key");
+  EXPECT_EQ(transfers, nullptr);
+  co_await std::move(wait);
+}
+
+TEST(InFlightTransfersTest, CallerCancellationDoesNotAbandonCompletionWait) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  folly::CancellationSource callerCancellation;
+  callerCancellation.requestCancellation();
+  auto wait = folly::coro::co_withExecutor(&executor,
+                                           folly::coro::co_withCancellation(
+                                               callerCancellation.getToken(),
+                                               transfers.cancelAndWait("key")))
+                  .start();
+  executor.drain();
+  EXPECT_FALSE(wait.isReady());
+  transfer.reset();
+  executor.drain();
+  ASSERT_TRUE(wait.isReady());
+  std::move(wait).get();
 }

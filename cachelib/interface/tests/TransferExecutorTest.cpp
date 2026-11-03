@@ -19,6 +19,7 @@
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/Task.h>
+#include <folly/executors/ManualExecutor.h>
 #include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
@@ -116,13 +117,17 @@ class TransferPause {
 
 class PausingConnector final : public Connector {
  public:
-  explicit PausingConnector(TransferPause* pause = nullptr) : pause_(pause) {}
+  explicit PausingConnector(TransferPause* pause = nullptr, bool fail = false)
+      : pause_(pause), fail_(fail) {}
 
   folly::coro::Task<Result<AllocatedDescriptor>> transfer(
       ReadDescriptor source, AllocatedDescriptor destination) override {
     ++calls;
     if (pause_) {
       co_await pause_->wait();
+    }
+    if (fail_) {
+      co_return makeError(Error::Code::INVALID_ARGUMENTS, "transfer failed");
     }
     co_return co_await connector_.transfer(std::move(source),
                                            std::move(destination));
@@ -132,6 +137,7 @@ class PausingConnector final : public Connector {
 
  private:
   TransferPause* pause_;
+  bool fail_;
   MemcpyConnector connector_;
 };
 
@@ -223,21 +229,28 @@ class TransferExecutorTest : public ::testing::Test {
         .CacheComponentWithStats::getStats();
   }
 
-  folly::coro::Task<void> cancelPausedTransfer(TransferPause& pause,
-                                               CacheComponent& destination,
-                                               Connector& connector) {
+  folly::coro::Task<void> cancelAndWaitForPausedTransfer(
+      TransferPause& pause, CacheComponent& destination, Connector& connector) {
+    folly::ManualExecutor waiterExecutor;
     TransferExecutor executor;
     SCOPE_EXIT { pause.release(); };
 
     EXPECT_OK(executor.submit(makeDetachedItem("key", "value"), destination,
                               connector, acquire("key")));
     CO_ASSERT_TRUE(pause.waitUntilStarted());
-    inFlight_.cancel("key");
+    auto completed = folly::coro::co_withExecutor(
+                         &waiterExecutor, inFlight_.cancelAndWait("key"))
+                         .start();
+    waiterExecutor.drain();
+    EXPECT_FALSE(completed.isReady());
     EXPECT_FALSE(inFlight_.tryAcquireTransferToken("key").has_value());
     EXPECT_EQ(componentStats().release_.throughput_.calls_, 0);
 
     pause.release();
-    executor.closeAndDrain();
+    while (!completed.isReady()) {
+      waiterExecutor.drive();
+    }
+    EXPECT_NO_THROW(std::move(completed).get());
     EXPECT_TRUE(inFlight_.tryAcquireTransferToken("key").has_value());
     const auto stats = componentStats();
     EXPECT_EQ(stats.allocate_.throughput_.calls_, 1);
@@ -245,6 +258,7 @@ class TransferExecutorTest : public ::testing::Test {
     EXPECT_EQ(stats.release_.throughput_.successes_, 1);
     auto found = CO_ASSERT_OK(co_await destination_->find("key"));
     EXPECT_FALSE(found.has_value());
+    executor.closeAndDrain();
   }
 
   InFlightTransfers inFlight_;
@@ -324,53 +338,80 @@ TEST_F(TransferExecutorTest, CancellationBeforeStartSkipsAllocation) {
   EXPECT_TRUE(inFlight_.tryAcquireTransferToken("key").has_value());
 }
 
-CO_TEST_F(TransferExecutorTest, CancellationDuringAllocationSkipsCopy) {
+CO_TEST_F(TransferExecutorTest, CancelAndWaitDuringAllocationSkipsCopy) {
   TransferPause pause;
   PausingCacheComponent destination(*destination_, &pause, nullptr);
   PausingConnector connector;
 
-  co_await cancelPausedTransfer(pause, destination, connector);
+  co_await cancelAndWaitForPausedTransfer(pause, destination, connector);
   EXPECT_EQ(connector.calls, 0);
 }
 
-CO_TEST_F(TransferExecutorTest, CancellationDuringCopySkipsInsertion) {
+CO_TEST_F(TransferExecutorTest, CancelAndWaitDuringCopySkipsInsertion) {
   TransferPause pause;
   PausingConnector connector(&pause);
 
-  co_await cancelPausedTransfer(pause, *destination_, connector);
+  co_await cancelAndWaitForPausedTransfer(pause, *destination_, connector);
   EXPECT_EQ(connector.calls, 1);
 }
 
-CO_TEST_F(TransferExecutorTest, CancellationDuringInsertionLetsItFinish) {
+CO_TEST_F(TransferExecutorTest, CancelAndWaitWaitsForCleanupAfterFailure) {
+  TransferPause pause;
+  PausingConnector connector(&pause, true);
+
+  co_await cancelAndWaitForPausedTransfer(pause, *destination_, connector);
+  EXPECT_EQ(connector.calls, 1);
+}
+
+CO_TEST_F(TransferExecutorTest, CancelAndWaitDuringInsertionLetsItFinish) {
   TransferPause pause;
   PausingCacheComponent destination(*destination_, nullptr, &pause);
+  folly::ManualExecutor waiterExecutor;
   TransferExecutor executor;
   SCOPE_EXIT { pause.release(); };
 
   EXPECT_OK(executor.submit(makeDetachedItem("key", "value"), destination,
                             connector_, acquire("key")));
   CO_ASSERT_TRUE(pause.waitUntilStarted());
-  inFlight_.cancel("key");
+  auto completed = folly::coro::co_withExecutor(&waiterExecutor,
+                                                inFlight_.cancelAndWait("key"))
+                       .start();
+  waiterExecutor.drain();
+  EXPECT_FALSE(completed.isReady());
   EXPECT_FALSE(inFlight_.tryAcquireTransferToken("key").has_value());
   auto before = CO_ASSERT_OK(co_await destination_->find("key"));
   EXPECT_FALSE(before.has_value());
 
   pause.release();
-  executor.closeAndDrain();
+  while (!completed.isReady()) {
+    waiterExecutor.drive();
+  }
+  EXPECT_NO_THROW(std::move(completed).get());
 
   EXPECT_TRUE(inFlight_.tryAcquireTransferToken("key").has_value());
   auto after = CO_ASSERT_OK(co_await destination_->find("key"));
   CO_ASSERT_TRUE(after.has_value());
   EXPECT_EQ(valueOf(*after), "value");
+  executor.closeAndDrain();
 }
 
 TEST_F(TransferExecutorTest, RejectsWorkAfterClose) {
+  folly::ManualExecutor waiterExecutor;
   TransferExecutor executor;
   executor.closeAndDrain();
+  auto transfer = acquire("key");
+  auto completed = folly::coro::co_withExecutor(&waiterExecutor,
+                                                inFlight_.cancelAndWait("key"))
+                       .start();
+  waiterExecutor.drain();
+  EXPECT_FALSE(completed.isReady());
 
   EXPECT_ERROR(executor.submit(makeDetachedItem("key", "value"), *destination_,
-                               connector_, acquire("key")),
+                               connector_, std::move(transfer)),
                Error::Code::SHUTDOWN_FAILED);
+  waiterExecutor.drain();
+  ASSERT_TRUE(completed.isReady());
+  EXPECT_NO_THROW(std::move(completed).get());
   EXPECT_TRUE(inFlight_.tryAcquireTransferToken("key").has_value());
 
   auto found = ASSERT_OK(folly::coro::blockingWait(destination_->find("key")));

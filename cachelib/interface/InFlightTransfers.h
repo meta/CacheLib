@@ -17,6 +17,7 @@
 #pragma once
 
 #include <folly/CancellationToken.h>
+#include <folly/coro/Task.h>
 
 #include <memory>
 #include <optional>
@@ -28,7 +29,7 @@ namespace facebook::cachelib::interface {
 /**
  * Registers one transfer per key and provides cooperative cancellation.
  * Callers own execution and retain the transfer token until their work ends.
- * Cancellation does not wait for completion or authorize cache publication.
+ * Cancellation does not authorize cache publication or serialize mutations.
  */
 class InFlightTransfers {
  private:
@@ -39,11 +40,11 @@ class InFlightTransfers {
   class TransferToken {
    public:
     TransferToken() = default;
-    ~TransferToken() = default;
+    ~TransferToken();
     TransferToken(const TransferToken&) = delete;
     TransferToken& operator=(const TransferToken&) = delete;
     TransferToken(TransferToken&&) noexcept = default;
-    TransferToken& operator=(TransferToken&&) noexcept = default;
+    TransferToken& operator=(TransferToken&& other) noexcept;
 
     // Retaining a cancellation token does not retain the registration.
     folly::CancellationToken getCancellationToken() const noexcept;
@@ -51,6 +52,7 @@ class InFlightTransfers {
    private:
     friend InFlightTransfers;
     explicit TransferToken(std::shared_ptr<Entry> entry) noexcept;
+    void finish() noexcept;
 
     std::shared_ptr<Entry> entry_;
   };
@@ -72,7 +74,18 @@ class InFlightTransfers {
   // after the owning token is released.
   void cancel(Key key);
 
+  // Snapshots the current transfer and requests cancellation immediately.
+  // Await the returned task for owning-token release after execution/cleanup.
+  // The task can outlive this registry and ignores caller cancellation.
+  // It only waits for the observed transfer; once that transfer releases its
+  // registration, tryAcquireTransferToken() can register a new one.
+  folly::coro::Task<void> cancelAndWait(Key key);
+
  private:
+  std::shared_ptr<Entry> findEntry(Key key) const;
+  static folly::coro::Task<void> waitForCompletion(
+      std::shared_ptr<Entry> entry);
+
   std::shared_ptr<State> state_;
 };
 
