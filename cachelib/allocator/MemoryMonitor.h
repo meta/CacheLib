@@ -133,11 +133,13 @@ class MemoryMonitor : public PeriodicWorker {
     // CacheAllocatorConfig::enableMemoryMonitor() for setting it on a cold
     // start.
     //
-    // poolIds is not persisted. Slabs advised away from pools outside poolIds
-    // (e.g. by a monitor with different poolIds before a warm restart) stay
-    // advised away until a monitor covering those pools reclaims them, e.g. one
-    // with empty poolIds. Reclaiming them is up to the caller.
+    // poolIds is not persisted. startNewMemMonitor() reclaims slabs advised
+    // away from pools outside the configured set before starting the monitor.
+    // With monitoring disabled, calling startNewMemMonitor() reclaims all
+    // advised slabs. Warm attach does not reclaim slabs until that call.
     std::set<PoolId> poolIds{};
+
+    bool disabled() const { return mode == Mode::Disabled; }
   };
 
   // Memory monitoring can be setup to run in one of the two following modes:

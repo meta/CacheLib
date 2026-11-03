@@ -1635,6 +1635,8 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
     AllocatorT alloc(config);
     const auto pools = addAndFillPools(alloc, {20, 20});
     ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
+    alloc.memMonitor_->updateNumSlabsToAdvise(10);
+    alloc.memMonitor_->checkPoolsAndAdviseReclaim();
     const auto* runningMonitor = alloc.memMonitor_.get();
 
     auto memConfig = config.memMonitorConfig;
@@ -1645,6 +1647,8 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
         std::invalid_argument);
     EXPECT_EQ(runningMonitor, alloc.memMonitor_.get());
     EXPECT_EQ(20, alloc.getCacheMemoryStats().maxAdvisedPct);
+    EXPECT_EQ((std::vector<size_t>{5, 5}),
+              this->getNumSlabsAdvised(alloc, pools));
     EXPECT_THROW(alloc.getNumSlabsAdvised(std::set<PoolId>{42}),
                  std::invalid_argument);
   }
@@ -1704,10 +1708,7 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
     EXPECT_EQ(0, memMonitor.numSlabsToAdvise_.load());
   }
 
-  // After a warm restart with poolIds set, the monitor resumes from the slabs
-  // advised away from the selected pools only and leaves slabs advised away
-  // from the other pools alone.
-  void testMemMonitorPoolSubsetWarmRestart() {
+  void testMemMonitorPoolSubsetWarmRestart(bool delayWorkers = false) {
     auto config = makeManualMemMonitorConfig(60, {});
     config.enableCachePersistence(this->cacheDir_);
     std::vector<PoolId> pools;
@@ -1723,18 +1724,85 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
     }
 
     config.memMonitorConfig.poolIds = {pools[1]};
+    if (delayWorkers) {
+      config.setDelayCacheWorkersStart();
+    }
     AllocatorT alloc(AllocatorT::SharedMemAttach, config);
+    if (delayWorkers) {
+      EXPECT_EQ(nullptr, alloc.memMonitor_);
+      EXPECT_EQ((std::vector<size_t>{10, 10, 10}),
+                this->getNumSlabsAdvised(alloc, pools));
+      EXPECT_EQ(10 * Slab::kSize, alloc.getPool(pools[0]).getPoolUsableSize());
+      EXPECT_EQ(10 * Slab::kSize, alloc.getPool(pools[2]).getPoolUsableSize());
+      alloc.startCacheWorkers();
+    }
+    EXPECT_EQ((std::vector<size_t>{0, 10, 0}),
+              this->getNumSlabsAdvised(alloc, pools));
+    EXPECT_EQ(20 * Slab::kSize, alloc.getPool(pools[0]).getPoolUsableSize());
+    EXPECT_EQ(20 * Slab::kSize, alloc.getPool(pools[2]).getPoolUsableSize());
     ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
     auto& memMonitor = *alloc.memMonitor_;
     EXPECT_EQ(10, memMonitor.numSlabsToAdvise_.load());
 
     memMonitor.checkPoolsAndAdviseReclaim();
-    EXPECT_EQ((std::vector<size_t>{10, 10, 10}),
+    EXPECT_EQ((std::vector<size_t>{0, 10, 0}),
               this->getNumSlabsAdvised(alloc, pools));
 
     memMonitor.updateNumSlabsToAdvise(-10);
     memMonitor.checkPoolsAndAdviseReclaim();
-    EXPECT_EQ((std::vector<size_t>{10, 0, 10}),
+    EXPECT_EQ((std::vector<size_t>{0, 0, 0}),
+              this->getNumSlabsAdvised(alloc, pools));
+  }
+
+  void testMemMonitorDisabledWarmRestart(bool zeroInterval) {
+    auto config = makeManualMemMonitorConfig(12, {});
+    config.enableCachePersistence(this->cacheDir_);
+    std::vector<PoolId> pools;
+    {
+      AllocatorT alloc(AllocatorT::SharedMemNew, config);
+      pools = addAndFillPools(alloc, {4, 8});
+      ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
+      alloc.memMonitor_->updateNumSlabsToAdvise(12);
+      alloc.memMonitor_->checkPoolsAndAdviseReclaim();
+      ASSERT_EQ((std::vector<size_t>{4, 8}),
+                this->getNumSlabsAdvised(alloc, pools));
+      alloc.shutDown();
+    }
+
+    config.memMonitorConfig.poolIds = {pools[1]};
+    if (zeroInterval) {
+      config.memMonitorInterval = std::chrono::seconds{0};
+      config.setDelayCacheWorkersStart();
+    } else {
+      config.memMonitorConfig.mode = MemoryMonitor::Disabled;
+    }
+    {
+      AllocatorT alloc(AllocatorT::SharedMemAttach, config);
+      EXPECT_EQ(nullptr, alloc.memMonitor_);
+      EXPECT_EQ((std::vector<size_t>{4, 8}),
+                this->getNumSlabsAdvised(alloc, pools));
+      EXPECT_EQ(0, alloc.getCacheMemoryStats().ramCacheSize);
+      alloc.startCacheWorkers();
+      EXPECT_EQ(nullptr, alloc.memMonitor_);
+      EXPECT_EQ((std::vector<size_t>{4, 8}),
+                this->getNumSlabsAdvised(alloc, pools));
+
+      ASSERT_TRUE(alloc.startNewMemMonitor(config.memMonitorInterval,
+                                           config.memMonitorConfig, nullptr));
+      EXPECT_EQ(nullptr, alloc.memMonitor_);
+      EXPECT_EQ((std::vector<size_t>{0, 0}),
+                this->getNumSlabsAdvised(alloc, pools));
+      EXPECT_EQ(4 * Slab::kSize, alloc.getPool(pools[0]).getPoolUsableSize());
+      EXPECT_EQ(8 * Slab::kSize, alloc.getPool(pools[1]).getPoolUsableSize());
+      EXPECT_EQ(12 * Slab::kSize, alloc.getCacheMemoryStats().ramCacheSize);
+      for (const auto pid : pools) {
+        this->fillUpOneSlab(alloc, pid, alloc.getPool(pid).getAllocSizes()[0],
+                            25 /* keyLen */);
+      }
+      alloc.shutDown();
+    }
+    AllocatorT alloc(AllocatorT::SharedMemAttach, config);
+    EXPECT_EQ((std::vector<size_t>{0, 0}),
               this->getNumSlabsAdvised(alloc, pools));
   }
 
@@ -1829,9 +1897,7 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
     EXPECT_EQ(alloc.serializeConfigParams()["memMonitorPoolIds"], "all");
   }
 
-  // startNewMemMonitor() on a running monitor replaces it and seeds the new
-  // monitor from the slabs advised away from its own pools.
-  void testMemMonitorReplaceRunningMonitor() {
+  void testMemMonitorReplaceRunningMonitor(bool stopFirst = false) {
     auto config = makeManualMemMonitorConfig(60, {});
     AllocatorT alloc(config);
     const auto pools = addAndFillPools(alloc, {20, 20, 20});
@@ -1844,13 +1910,57 @@ class AllocatorResizeTest : public AllocatorTest<AllocatorT> {
     auto memConfig = config.memMonitorConfig;
     memConfig.poolIds = {pools[1]};
     memConfig.maxAdvisePercent = 30;
+    if (stopFirst) {
+      ASSERT_TRUE(alloc.stopMemMonitor());
+    }
     ASSERT_TRUE(alloc.startNewMemMonitor(config.memMonitorInterval, memConfig,
                                          nullptr));
     ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
     EXPECT_EQ(10, alloc.memMonitor_->numSlabsToAdvise_.load());
     EXPECT_EQ(30, alloc.getCacheMemoryStats().maxAdvisedPct);
-    EXPECT_EQ((std::vector<size_t>{10, 10, 10}),
+    EXPECT_EQ((std::vector<size_t>{0, 10, 0}),
               this->getNumSlabsAdvised(alloc, pools));
+    EXPECT_EQ(20 * Slab::kSize, alloc.getPool(pools[0]).getPoolUsableSize());
+    EXPECT_EQ(20 * Slab::kSize, alloc.getPool(pools[2]).getPoolUsableSize());
+
+    memConfig.poolIds = {pools[0], pools[2]};
+    ASSERT_TRUE(alloc.startNewMemMonitor(config.memMonitorInterval, memConfig,
+                                         nullptr));
+    ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
+    EXPECT_EQ(0, alloc.memMonitor_->numSlabsToAdvise_.load());
+    EXPECT_EQ((std::vector<size_t>{0, 0, 0}),
+              this->getNumSlabsAdvised(alloc, pools));
+    alloc.memMonitor_->updateNumSlabsToAdvise(4);
+    alloc.memMonitor_->checkPoolsAndAdviseReclaim();
+    EXPECT_EQ((std::vector<size_t>{2, 0, 2}),
+              this->getNumSlabsAdvised(alloc, pools));
+  }
+
+  void testMemMonitorDisableAtRuntime(bool zeroInterval) {
+    auto config = makeManualMemMonitorConfig(12, {});
+    AllocatorT alloc(config);
+    const auto pools = addAndFillPools(alloc, {4, 8});
+    ASSERT_NO_FATAL_FAILURE(this->waitForFirstMemMonitorRun(alloc));
+    alloc.memMonitor_->updateNumSlabsToAdvise(6);
+    alloc.memMonitor_->checkPoolsAndAdviseReclaim();
+    ASSERT_EQ((std::vector<size_t>{2, 4}),
+              this->getNumSlabsAdvised(alloc, pools));
+
+    auto memConfig = config.memMonitorConfig;
+    memConfig.poolIds = {pools[1]};
+    if (!zeroInterval) {
+      memConfig.mode = MemoryMonitor::Disabled;
+    }
+    ASSERT_TRUE(alloc.startNewMemMonitor(
+        zeroInterval ? std::chrono::seconds{0} : config.memMonitorInterval,
+        memConfig, nullptr));
+    EXPECT_EQ(nullptr, alloc.memMonitor_);
+    EXPECT_EQ((std::vector<size_t>{0, 0}),
+              this->getNumSlabsAdvised(alloc, pools));
+    EXPECT_EQ(12 * Slab::kSize, alloc.getCacheMemoryStats().ramCacheSize);
+    EXPECT_EQ(0, alloc.getCacheMemoryStats().maxAdvisedPct);
+    alloc.startCacheWorkers();
+    EXPECT_EQ(nullptr, alloc.memMonitor_);
   }
 };
 } // namespace tests

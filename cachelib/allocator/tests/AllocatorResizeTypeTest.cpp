@@ -108,6 +108,18 @@ TYPED_TEST(AllocatorResizeTest, MemMonitorPoolSubsetWarmRestart) {
   this->testMemMonitorPoolSubsetWarmRestart();
 }
 
+TYPED_TEST(AllocatorResizeTest, MemMonitorPoolSubsetWarmRestartDelayedWorkers) {
+  this->testMemMonitorPoolSubsetWarmRestart(true);
+}
+
+TYPED_TEST(AllocatorResizeTest, MemMonitorDisabledWarmRestart) {
+  this->testMemMonitorDisabledWarmRestart(false);
+}
+
+TYPED_TEST(AllocatorResizeTest, MemMonitorZeroIntervalWarmRestart) {
+  this->testMemMonitorDisabledWarmRestart(true);
+}
+
 TYPED_TEST(AllocatorResizeTest, MemMonitorPoolSubsetRollbackAttach) {
   this->testMemMonitorPoolSubsetRollbackAttach();
 }
@@ -118,6 +130,18 @@ TYPED_TEST(AllocatorResizeTest, MemMonitorRestartWhileReadingStats) {
 
 TYPED_TEST(AllocatorResizeTest, MemMonitorReplaceRunningMonitor) {
   this->testMemMonitorReplaceRunningMonitor();
+}
+
+TYPED_TEST(AllocatorResizeTest, MemMonitorRestartWithDifferentPools) {
+  this->testMemMonitorReplaceRunningMonitor(true);
+}
+
+TYPED_TEST(AllocatorResizeTest, MemMonitorDisableAtRuntime) {
+  this->testMemMonitorDisableAtRuntime(false);
+}
+
+TYPED_TEST(AllocatorResizeTest, MemMonitorZeroIntervalAtRuntime) {
+  this->testMemMonitorDisableAtRuntime(true);
 }
 
 TYPED_TEST(AllocatorResizeTest, ShrinkGrowthAdviseRaceCondition) {
