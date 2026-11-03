@@ -49,6 +49,8 @@ class CacheMonitorFactory {
   virtual std::unique_ptr<CacheMonitor> create(Lru2QAllocator& cache) = 0;
   virtual std::unique_ptr<CacheMonitor> create(Lru5BAllocator& cache) = 0;
   virtual std::unique_ptr<CacheMonitor> create(Lru5B2QAllocator& cache) = 0;
+  virtual std::unique_ptr<CacheMonitor> create(S3FIFOAllocator& cache) = 0;
+  virtual std::unique_ptr<CacheMonitor> create(TinyLFUAllocator& cache) = 0;
 };
 
 // Parse memory tiers configuration from JSON config
@@ -126,6 +128,10 @@ struct CacheConfig : public JSONConfig {
   // 2Q params
   size_t lru2qHotPct{20};
   size_t lru2qColdPct{20};
+
+  // S3FIFO params
+  size_t ghostSizePercent{100};
+  size_t tinySizePercent{10};
 
   double allocFactor{1.5};
   // maximum alloc size generated using the alloc factor above.

@@ -6760,6 +6760,8 @@ namespace facebook::cachelib {
 extern template class CacheAllocator<LruCacheTrait>;
 extern template class CacheAllocator<LruCacheWithSpinBucketsTrait>;
 extern template class CacheAllocator<Lru2QCacheTrait>;
+extern template class CacheAllocator<S3FIFOCacheTrait>;
+extern template class CacheAllocator<S3FIFO5BCacheTrait>;
 extern template class CacheAllocator<TinyLFUCacheTrait>;
 extern template class CacheAllocator<WTinyLFUCacheTrait>;
 
@@ -6780,6 +6782,15 @@ using LruAllocatorSpinBuckets = CacheAllocator<LruCacheWithSpinBucketsTrait>;
 //  3. items in cold queue are evicted to make room for new items
 using Lru2QAllocator = CacheAllocator<Lru2QCacheTrait>;
 using Lru5B2QAllocator = CacheAllocator<Lru5B2QCacheTrait>;
+
+// CacheAllocator with S3 FIFO eviction policy
+// It maintains 2 queues, one for for probation and one for the main queue.
+// New items are added to the probation queue, and if not accessed
+// will be quickly removed from the cache to remove 1 hit wonders.
+// If accessed while in probation, it will eventually be promoted to the main queue.
+// Items in the tail of main queue will be reinserted if accessed.
+using S3FIFOAllocator = CacheAllocator<S3FIFOCacheTrait>;
+using S3FIFO5BAllocator = CacheAllocator<S3FIFO5BCacheTrait>;
 
 // CacheAllocator with Tiny LFU eviction policy
 // It has a window initially to gauge the frequency of accesses of newly

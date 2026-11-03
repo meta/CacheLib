@@ -51,6 +51,9 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, lru2qHotPct);
   JSONSetVal(configJson, lru2qColdPct);
 
+  JSONSetVal(configJson, ghostSizePercent);
+  JSONSetVal(configJson, tinySizePercent);
+
   JSONSetVal(configJson, allocFactor);
   JSONSetVal(configJson, maxAllocSize);
   JSONSetVal(configJson, minAllocSize);
