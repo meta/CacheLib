@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 
 #include "cachelib/common/Utils.h"
@@ -116,6 +117,27 @@ TEST(FDP, PrepUringTest) {
 }
 
 #endif
+#endif
+
+#ifdef CACHELIB_IOURING_DISABLE
+TEST(Device, UnavailableIoUringBackend) {
+  auto filePath = fmt::format("/tmp/DEVICE_UNAVAILABLE_IOURING_TEST-{}-{}",
+                              ::getpid(), folly::Random::rand64());
+  SCOPE_EXIT { util::removePath(filePath); };
+
+  constexpr uint32_t blockSize = 4096;
+  // A depth of one reaches async backend creation without a fiber context.
+  auto device = createFileDevice(
+      {filePath}, blockSize, false /* truncateFile */, blockSize, blockSize,
+      0 /* maxWriteSize */, IoEngine::IoUring, 1 /* qDepth */,
+      false /* isFDPEnabled */, nullptr /* encryptor */,
+      false /* isExclusiveOwner */);
+  auto buffer = device->makeIOBuffer(blockSize);
+
+  // Backend creation is lazy, so exercise both first-I/O entry points.
+  EXPECT_THROW(device->write(0, buffer.view()), std::runtime_error);
+  EXPECT_THROW(device->read(0, blockSize, buffer.data()), std::runtime_error);
+}
 #endif
 
 TEST(Device, BytesWritten) {

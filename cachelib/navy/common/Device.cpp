@@ -1116,6 +1116,15 @@ IoContext* FileDevice::getIoContext() {
       asyncBase = std::make_unique<folly::AsyncIO>(qDepthPerContext_, pollMode);
     }
 
+    if (!asyncBase) {
+      // Reachable when io_uring is requested but this binary was built
+      // without liburing (CACHELIB_IOURING_DISABLE). Fail loudly instead of
+      // crashing on a null deref in AsyncIoContext.
+      throw std::runtime_error(
+          "async io requested but no AsyncBase backend is available in this "
+          "build (io_uring support compiled out?)");
+    }
+
     auto idx = incrementalIdx_++;
     tlContext_.reset(new AsyncIoContext(std::move(asyncBase), idx, evb,
                                         qDepthPerContext_, useIoUring,
