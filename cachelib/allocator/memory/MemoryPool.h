@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -132,6 +133,31 @@ class MemoryPool {
   }
 
   MPStats getStats() const;
+
+  // Caps how many slabs each allocation class may take from this pool's
+  // unallocated memory, indexed by ClassId. A class at its cap gets nullptr
+  // from allocate() instead of a new slab, so the caller evicts within that
+  // class. This imposes a slab distribution while the pool fills, before
+  // eviction-driven rebalancing has anything to act on. Slabs moved in by the
+  // rebalancer or by provision() are not limited. The caps lift on their own
+  // once every slab is allocated or `maxDuration` elapses. An empty vector
+  // removes them.
+  void setSlabCaps(std::vector<uint32_t> caps,
+                   std::chrono::seconds maxDuration);
+
+  // Replaces the caps of an active warm-up without moving its deadline. Does
+  // nothing once the caps have lifted, so a pool that has filled stays
+  // uncapped.
+  void updateSlabCaps(std::vector<uint32_t> caps);
+
+  bool hasSlabCaps() const noexcept {
+    return slabCapsActive_.load(std::memory_order_relaxed);
+  }
+
+  // number of times a class was refused a new slab because of its cap.
+  uint64_t getSlabCapDenials() const noexcept {
+    return slabCapDenials_.load(std::memory_order_relaxed);
+  }
 
   // Provision each allocation class with prescribed number of slabs.
   //
@@ -361,6 +387,17 @@ class MemoryPool {
   // @throw std::invalid_argument if there are no free slabs available.
   SlabReleaseContext releaseFromFreeSlabs();
 
+  // true if `ac` is at its slab cap and must evict rather than take a slab.
+  // Lifts the caps once they have expired. Caller must hold lock_.
+  bool atSlabCapLocked(const AllocationClass& ac);
+
+  // Caller must hold lock_.
+  void clearSlabCapsLocked();
+
+  // Forgets which classes were refused at their cap, so each one takes the
+  // locked path once more. Caller must hold lock_.
+  void resetClassesAtSlabCapLocked() noexcept;
+
   // mutex for serializing access to freeSlabs_ and the currSlabAllocSize_.
   mutable std::mutex lock_;
 
@@ -397,6 +434,19 @@ class MemoryPool {
 
   // Current configuration of advised away Slabs in the pool
   std::atomic<uint64_t> curSlabsAdvised_{0};
+
+  // per-ClassId slab caps and their expiry, guarded by lock_. Empty when off.
+  std::vector<uint32_t> slabCaps_;
+  std::chrono::steady_clock::time_point slabCapsExpiry_{};
+  std::atomic<bool> slabCapsActive_{false};
+  std::atomic<uint64_t> slabCapDenials_{0};
+  // Per ClassId: refused at its cap since the caps were last set or updated,
+  // so later allocations in the class are refused without taking lock_.
+  // Sized when caps are first set, and never resized while they are active.
+  // A class that drops below its cap (a slab released by the rebalancer) or
+  // whose caps expire stays refused until the next setSlabCaps or
+  // updateSlabCaps; the warm-up gate calls updateSlabCaps periodically.
+  std::vector<std::atomic<bool>> classAtSlabCap_;
 
   // number of slabs we released for resizes and rebalances
   std::atomic<unsigned int> nSlabResize_{0};

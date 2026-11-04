@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <random>
@@ -943,4 +944,106 @@ TEST_F(MemoryPoolTest, AllocReleaseMT) {
 
   ASSERT_TRUE(mp.allSlabsAllocated());
   ASSERT_FALSE(mp.overLimit());
+}
+
+namespace {
+constexpr uint32_t kSmallAllocSize = Slab::kSize / 8;
+constexpr uint32_t kLargeAllocSize = Slab::kSize / 2;
+constexpr size_t kMaxAllocAttempts = 10000;
+
+// allocates `size` until the pool refuses, returning how many succeeded.
+size_t allocateUntilRefused(MemoryPool& mp, uint32_t size) {
+  size_t n = 0;
+  while (n < kMaxAllocAttempts && mp.allocate(size) != nullptr) {
+    ++n;
+  }
+  return n;
+}
+} // namespace
+
+TEST_F(MemoryPoolTest, SlabCapStopsGreedyClassDuringFill) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 10 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  const uint32_t largeCap = 2;
+  mp.setSlabCaps({8, largeCap}, std::chrono::hours{1});
+
+  const size_t largeAllocs = allocateUntilRefused(mp, kLargeAllocSize);
+
+  EXPECT_EQ(largeCap * (Slab::kSize / kLargeAllocSize), largeAllocs);
+  EXPECT_FALSE(mp.allSlabsAllocated());
+  EXPECT_GT(mp.getSlabCapDenials(), 0);
+  EXPECT_NE(nullptr, mp.allocate(kSmallAllocSize));
+}
+
+TEST_F(MemoryPoolTest, SlabCapsLiftAfterMaxDuration) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 10 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  mp.setSlabCaps({1, 1}, std::chrono::seconds{0});
+
+  const size_t threeSlabsOfLarge = 3 * (Slab::kSize / kLargeAllocSize);
+  for (size_t i = 0; i < threeSlabsOfLarge; ++i) {
+    ASSERT_NE(nullptr, mp.allocate(kLargeAllocSize));
+  }
+
+  EXPECT_FALSE(mp.hasSlabCaps());
+}
+
+TEST_F(MemoryPoolTest, UpdatedSlabCapsTakeEffectDuringFill) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 10 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  mp.setSlabCaps({8, 1}, std::chrono::hours{1});
+  const size_t perSlab = Slab::kSize / kLargeAllocSize;
+  ASSERT_EQ(perSlab, allocateUntilRefused(mp, kLargeAllocSize));
+
+  mp.updateSlabCaps({8, 3});
+
+  EXPECT_TRUE(mp.hasSlabCaps());
+  EXPECT_EQ(2 * perSlab, allocateUntilRefused(mp, kLargeAllocSize));
+}
+
+TEST_F(MemoryPoolTest, RefusedClassRetriesOnceCapsAreSetAgain) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 10 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  mp.setSlabCaps({8, 1}, std::chrono::hours{1});
+  const size_t perSlab = Slab::kSize / kLargeAllocSize;
+  ASSERT_EQ(perSlab, allocateUntilRefused(mp, kLargeAllocSize));
+  const auto denials = mp.getSlabCapDenials();
+
+  EXPECT_EQ(nullptr, mp.allocate(kLargeAllocSize));
+  EXPECT_EQ(denials + 1, mp.getSlabCapDenials());
+
+  mp.setSlabCaps({8, 2}, std::chrono::hours{1});
+
+  EXPECT_EQ(perSlab, allocateUntilRefused(mp, kLargeAllocSize));
+}
+
+TEST_F(MemoryPoolTest, UpdateDoesNotRearmLiftedSlabCaps) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 4 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  mp.setSlabCaps({2, 2}, std::chrono::hours{1});
+  allocateUntilRefused(mp, kSmallAllocSize);
+  allocateUntilRefused(mp, kLargeAllocSize);
+  ASSERT_FALSE(mp.hasSlabCaps());
+
+  mp.updateSlabCaps({1, 1});
+
+  EXPECT_FALSE(mp.hasSlabCaps());
+}
+
+TEST_F(MemoryPoolTest, SlabCapsLiftOnceThePoolFills) {
+  auto slabAlloc = createSlabAllocator(20);
+  MemoryPool mp(1, 4 * Slab::kSize, *slabAlloc,
+                {kSmallAllocSize, kLargeAllocSize});
+  mp.setSlabCaps({2, 2}, std::chrono::hours{1});
+
+  allocateUntilRefused(mp, kSmallAllocSize);
+  allocateUntilRefused(mp, kLargeAllocSize);
+
+  EXPECT_TRUE(mp.allSlabsAllocated());
+  EXPECT_FALSE(mp.hasSlabCaps());
 }

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <limits>
 
 #include "cachelib/allocator/memory/AllocationClass.h"
@@ -238,6 +239,24 @@ class MemoryAllocator {
   bool provisionPool(PoolId pid,
                      const std::vector<uint32_t>& slabsDistribution) {
     return memoryPoolManager_.provisionPool(pid, slabsDistribution);
+  }
+
+  // Limit how many unallocated slabs each allocation class of the pool may
+  // take while it fills. See MemoryPool::setSlabCaps.
+  void setPoolSlabCaps(PoolId pid,
+                       std::vector<uint32_t> caps,
+                       std::chrono::seconds maxDuration) {
+    memoryPoolManager_.getPoolById(pid).setSlabCaps(std::move(caps),
+                                                    maxDuration);
+  }
+
+  // See MemoryPool::updateSlabCaps.
+  void updatePoolSlabCaps(PoolId pid, std::vector<uint32_t> caps) {
+    memoryPoolManager_.getPoolById(pid).updateSlabCaps(std::move(caps));
+  }
+
+  bool poolHasSlabCaps(PoolId pid) const {
+    return memoryPoolManager_.getPoolById(pid).hasSlabCaps();
   }
 
   // shrink the existing pool by _bytes_ .

@@ -326,6 +326,12 @@ void* MemoryPool::allocate(uint32_t size) {
     return nullptr;
   }
 
+  if (slabCapsActive_.load(std::memory_order_acquire) &&
+      classAtSlabCap_[ac.getId()].load(std::memory_order_relaxed)) {
+    slabCapDenials_.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+
   // TODO: introduce a new sharded lock by allocation class id for this slow
   // path Currently this would also serialize the slow paths of two different
   // allocation class ids that need slab to initiate an allocation.
@@ -334,6 +340,10 @@ void* MemoryPool::allocate(uint32_t size) {
   if (alloc != nullptr) {
     currAllocSize_ += allocSize;
     return alloc;
+  }
+
+  if (atSlabCapLocked(ac)) {
+    return nullptr;
   }
 
   // see if we have a slab to add to the allocation class.
@@ -346,9 +356,62 @@ void* MemoryPool::allocate(uint32_t size) {
   // add it to the allocation class and try to allocate.
   alloc = ac.addSlabAndAllocate(slab);
   XDCHECK_NE(nullptr, alloc);
+  if (allSlabsAllocated()) {
+    clearSlabCapsLocked();
+  }
 
   currAllocSize_ += allocSize;
   return alloc;
+}
+
+void MemoryPool::setSlabCaps(std::vector<uint32_t> caps,
+                             std::chrono::seconds maxDuration) {
+  LockHolder l(lock_);
+  if (classAtSlabCap_.empty()) {
+    classAtSlabCap_ = std::vector<std::atomic<bool>>(ac_.size());
+  }
+  resetClassesAtSlabCapLocked();
+  slabCaps_ = std::move(caps);
+  slabCapsExpiry_ = std::chrono::steady_clock::now() + maxDuration;
+  slabCapsActive_.store(!slabCaps_.empty(), std::memory_order_release);
+}
+
+void MemoryPool::updateSlabCaps(std::vector<uint32_t> caps) {
+  LockHolder l(lock_);
+  if (!slabCapsActive_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  slabCaps_ = std::move(caps);
+  resetClassesAtSlabCapLocked();
+}
+
+void MemoryPool::clearSlabCapsLocked() {
+  slabCaps_.clear();
+  slabCapsActive_.store(false, std::memory_order_relaxed);
+  resetClassesAtSlabCapLocked();
+}
+
+void MemoryPool::resetClassesAtSlabCapLocked() noexcept {
+  for (auto& atCap : classAtSlabCap_) {
+    atCap.store(false, std::memory_order_relaxed);
+  }
+}
+
+bool MemoryPool::atSlabCapLocked(const AllocationClass& ac) {
+  if (!slabCapsActive_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  if (std::chrono::steady_clock::now() >= slabCapsExpiry_) {
+    clearSlabCapsLocked();
+    return false;
+  }
+  const auto cid = static_cast<size_t>(ac.getId());
+  if (cid >= slabCaps_.size() || ac.getNumSlabs() < slabCaps_[cid]) {
+    return false;
+  }
+  slabCapDenials_.fetch_add(1, std::memory_order_relaxed);
+  classAtSlabCap_[cid].store(true, std::memory_order_relaxed);
+  return true;
 }
 
 void* MemoryPool::allocateZeroedSlab() { return allocate(Slab::kSize); }

@@ -918,6 +918,31 @@ class CacheAllocator : public CacheBase {
                                  double power,
                                  uint32_t minSlabsPerAC = 1);
 
+  // Cap how many unallocated slabs each allocation class may take while a new
+  // pool fills, so warm-up follows a target distribution instead of going to
+  // whichever classes allocate first. A class at its cap evicts within itself.
+  // The caps lift once every slab is allocated or `maxDuration` elapses.
+  //
+  // @param poolId        id of the pool
+  // @param caps          max slabs per AC, indexed by ClassId; empty to clear
+  // @param maxDuration   when to lift the caps if the pool has not filled
+  void setPoolSlabCaps(PoolId poolId,
+                       std::vector<uint32_t> caps,
+                       std::chrono::seconds maxDuration) {
+    allocator_->setPoolSlabCaps(poolId, std::move(caps), maxDuration);
+  }
+
+  // Replace the caps of a pool that is still warming up, keeping its deadline.
+  // No-op once the caps have lifted.
+  void updatePoolSlabCaps(PoolId poolId, std::vector<uint32_t> caps) {
+    allocator_->updatePoolSlabCaps(poolId, std::move(caps));
+  }
+
+  // true while the pool's warm-up slab caps are in force.
+  bool poolHasSlabCaps(PoolId poolId) const {
+    return allocator_->poolHasSlabCaps(poolId);
+  }
+
   // update an existing pool's config
   //
   // @param pid       pool id for the pool to be updated

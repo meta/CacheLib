@@ -102,6 +102,12 @@ class AllocationClass {
   // fetch stats about this allocation class.
   ACStats getStats() const;
 
+  // returns the number of slabs this allocation class owns, in use or free.
+  size_t getNumSlabs() const {
+    return lock_->lock_combine(
+        [this]() { return allocatedSlabs_.size() + freeSlabs_.size(); });
+  }
+
   // Whether the pool is full or free to allocate more in the current state.
   // This is only a hint and not a gurantee that subsequent allocate will
   // fail/succeed.
