@@ -444,7 +444,8 @@ std::optional<std::string> getDeviceModelNumber(
     const folly::StringPiece nvmePath,
     const folly::StringPiece devicePath) {
   std::string out;
-  if (!runNvmeCmd(processFactory, nvmePath, {"list", "-o", "json"}, out)) {
+  if (!runNvmeCmd(
+          processFactory, nvmePath, {"list", "-o", "json", "-v"}, out)) {
     XLOG(ERR) << "Failed to run nvme command!";
     return std::nullopt;
   }

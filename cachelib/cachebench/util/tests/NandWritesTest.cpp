@@ -93,9 +93,9 @@ TEST_F(NandWritesTest, nandWriteBytes_throwsOnSubprocessSpawnError) {
 // invalid_argument.
 TEST_F(NandWritesTest, nandWriteBytes_throwsIfListResponseNotValidJson) {
   auto listCmd = MockProcess::createWithOutput("not valid json");
-  EXPECT_CALL(
-      *mockFactory_,
-      createProcess(ElementsAre(kNvmePath, "list", "-o", "json"), _, _, _))
+  EXPECT_CALL(*mockFactory_,
+              createProcess(
+                  ElementsAre(kNvmePath, "list", "-o", "json", "-v"), _, _, _))
       .WillOnce(Return(listCmd));
   EXPECT_THROW(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_),
                std::invalid_argument);
@@ -166,7 +166,7 @@ TEST_F(NandWritesTest, nandWriteBytes_handlesSamsungDevice) {
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "samsung", "vs-smart-add-log", "/dev/nvme0n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_),
@@ -282,7 +282,7 @@ TEST_F(NandWritesTest, nandWriteBytes_handlesSamsungPM983aDevice) {
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "samsung", "vs-smart-add-log", "/dev/nvme1n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme1n1", kNvmePath, mockFactory_), 35061362294784);
@@ -403,7 +403,7 @@ TEST_F(NandWritesTest, nandWriteBytes_handlesSamsungPM9A3Device) {
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "samsung", "vs-smart-add-log", "/dev/nvme1n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme1n1", kNvmePath, mockFactory_), 241393664);
@@ -473,7 +473,7 @@ Trim count                              64506           0x0000000000000000000000
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "seagate", "vs-smart-add-log", "/dev/nvme0n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_),
@@ -545,7 +545,7 @@ TEST_F(NandWritesTest, nandWriteBytes_handlesWesternDigitalDevice) {
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "wdc", "vs-smart-add-log", "/dev/nvme1n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme1n1", kNvmePath, mockFactory_),
@@ -616,7 +616,7 @@ NAND Over-temperature Count              : 0 %
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "toshiba", "vs-smart-add-log", "/dev/nvme0n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_),
@@ -726,7 +726,7 @@ Incomplete shutdowns                          : 0
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "liteon", "vs-smart-add-log", "/dev/nvme1n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme1n1", kNvmePath, mockFactory_),
@@ -849,7 +849,7 @@ Log Page Version                                                            : 3
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "skhms", "vs-nand-stats", "/dev/nvme0n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_), 484533969);
@@ -906,7 +906,7 @@ host_bytes_written              : 100%       sectors: 172365270
 )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "intel", "smart-log-add", "/dev/nvme0n1"},
         kSmartLogOutput}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_),
@@ -991,7 +991,7 @@ TEST_F(NandWritesTest, nandWriteBytes_handlesOcpSupportedDevice_ModelListed) {
   )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "wdc", "vs-smart-add-log", "/dev/nvme0n1"},
         kSmartLogOutputErr},
        {{kNvmePath, "ocp", "smart-add-log", "/dev/nvme0n1"},
@@ -1075,7 +1075,7 @@ TEST_F(NandWritesTest,
   )EOF";
 
   mockFactory_->expectedCommands(
-      {{{kNvmePath, "list", "-o", "json"}, kListOutput},
+      {{{kNvmePath, "list", "-o", "json", "-v"}, kListOutput},
        {{kNvmePath, "ocp", "smart-add-log", "/dev/nvme0n1"},
         kSmartLogOutputOcp}});
   EXPECT_EQ(nandWriteBytes("nvme0n1", kNvmePath, mockFactory_), 88403820249088);
