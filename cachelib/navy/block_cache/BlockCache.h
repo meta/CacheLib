@@ -390,12 +390,14 @@ class BlockCache final : public Engine {
   // @param hk          Key of the entry. Only when combinedEntry == false
   // @param value       Payload of the entry
   // @param combinedEntry whether it's combined entry block or not
+  // @param precomputedChecksum Validated checksum of the unchanged value
   //
   void writeEntry(MutableBufferView buffer,
                   std::optional<HashedKey> hk,
                   BufferView value,
                   bool combinedEntry,
-                  uint32_t lastAccessTimeSecs = 0);
+                  uint32_t lastAccessTimeSecs = 0,
+                  std::optional<uint32_t> precomputedChecksum = std::nullopt);
   // @param regionDesc  Region descriptor for reading
   // @param ld          LookupData containing the entry metadata for reading
   // @param addrEnd     End of the entry since the item layout is backward

@@ -2057,6 +2057,7 @@ TEST(BlockCache, HitsReinsertionPolicy) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
   auto config = makeConfig(std::move(policy), *device);
+  config.checksum = true;
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));

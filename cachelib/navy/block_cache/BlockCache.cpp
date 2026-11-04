@@ -1246,7 +1246,8 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
 
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
-  writeEntry(bufferView, hk, value, false);
+  writeEntry(bufferView, hk, value, false, 0 /* lastAccessTimeSecs */,
+             entryDesc.cs);
   const auto replaced = index_->replaceIfMatch(hk.keyHash(),
                                                encodeRelAddress(addr.add(size)),
                                                encodeRelAddress(currAddr));
@@ -1326,7 +1327,8 @@ void BlockCache::writeEntry(MutableBufferView buffer,
                             std::optional<HashedKey> hk,
                             BufferView value,
                             bool combinedEntry,
-                            uint32_t lastAccessTimeSecs) {
+                            uint32_t lastAccessTimeSecs,
+                            std::optional<uint32_t> precomputedChecksum) {
   XDCHECK((combinedEntry && !hk.has_value()) ||
           (!combinedEntry && hk.has_value()));
 
@@ -1343,7 +1345,8 @@ void BlockCache::writeEntry(MutableBufferView buffer,
                                    lastAccessTimeSecs);
 
   if (checksumData_) {
-    desc->cs = checksum(value);
+    desc->cs = precomputedChecksum.has_value() ? *precomputedChecksum
+                                               : checksum(value);
   }
 
   if (!combinedEntry) {
