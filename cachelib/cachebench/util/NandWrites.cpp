@@ -23,6 +23,7 @@
 #include <folly/logging/xlog.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
