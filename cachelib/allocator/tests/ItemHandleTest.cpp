@@ -19,7 +19,6 @@
 #include <gmock/gmock.h>
 
 #include <algorithm>
-#include <future>
 #include <mutex>
 #include <thread>
 
