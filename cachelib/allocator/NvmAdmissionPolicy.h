@@ -163,11 +163,11 @@ class NvmAdmissionPolicy {
 
  private:
   util::PercentileStats overallLatency_;
-  AtomicCounter overallCount_{0};
-  AtomicCounter accepted_{0};
-  AtomicCounter rejected_{0};
-  AtomicCounter rejectedBytes_{0};
-  AtomicCounter ttlRejected_{0};
+  TLCounter overallCount_{0};
+  TLCounter accepted_{0};
+  TLCounter rejected_{0};
+  TLCounter rejectedBytes_{0};
+  TLCounter ttlRejected_{0};
   // The minimum TTL to an item need to have to be accepted.
   std::atomic<uint64_t> minTTL_{0};
 };
@@ -237,7 +237,7 @@ class RejectFirstAP final : public NvmAdmissionPolicy<Cache> {
 
   ApproxSplitSet tracker_;
   const size_t suffixIgnoreLength_;
-  AtomicCounter admitsByDramHits_{0};
+  TLCounter admitsByDramHits_{0};
   const bool useDramHitSignal_{true};
 };
 } // namespace cachelib

@@ -26,10 +26,10 @@ namespace detail {
 
 void Stats::init() {
   cacheHits = std::make_unique<PerPoolClassTLCounters>();
-  allocAttempts = std::make_unique<PerPoolClassAtomicCounters>();
-  evictionAttempts = std::make_unique<PerPoolClassAtomicCounters>();
-  fragmentationSize = std::make_unique<PerPoolClassAtomicCounters>();
-  allocFailures = std::make_unique<PerPoolClassAtomicCounters>();
+  allocAttempts = std::make_unique<PerPoolClassTLCounters>();
+  evictionAttempts = std::make_unique<PerPoolClassTLCounters>();
+  fragmentationSize = std::make_unique<PerPoolClassTLCounters>();
+  allocFailures = std::make_unique<PerPoolClassTLCounters>();
   chainedItemEvictions = std::make_unique<PerPoolClassAtomicCounters>();
   regularItemEvictions = std::make_unique<PerPoolClassAtomicCounters>();
   auto initToZero = [](auto& a) {
@@ -40,10 +40,8 @@ void Stats::init() {
     }
   };
 
-  initToZero(*allocAttempts);
-  initToZero(*evictionAttempts);
-  initToZero(*allocFailures);
-  initToZero(*fragmentationSize);
+  // TL counters start at zero; set(0) would allocate a thread-local slot per
+  // counter on this thread.
   initToZero(*chainedItemEvictions);
   initToZero(*regularItemEvictions);
 }
@@ -54,10 +52,10 @@ struct SizeVerify {};
 void Stats::populateGlobalCacheStats(GlobalCacheStats& ret) const {
 #ifndef SKIP_SIZE_VERIFY
 #ifdef __GLIBCXX__
-#define EXPECTED_SIZE 16944
+#define EXPECTED_SIZE 17024
 #endif
 #ifdef _LIBCPP_VERSION
-#define EXPECTED_SIZE 16944
+#define EXPECTED_SIZE 17024
 #endif
   SizeVerify<sizeof(Stats)> a = SizeVerify<EXPECTED_SIZE>{};
   std::ignore = a;
@@ -126,21 +124,6 @@ void Stats::populateGlobalCacheStats(GlobalCacheStats& ret) const {
   ret.nvmEvictionSecondsToExpiry = this->nvmEvictionSecondsToExpiry_.estimate();
   ret.nvmPutSize = this->nvmPutSize_.estimate();
   ret.nvmHitTTASecs = this->nvmHitTTASecs_.estimate();
-
-  auto accum = [](const PerPoolClassAtomicCounters& c) {
-    uint64_t sum = 0;
-    for (const auto& x : c) {
-      for (const auto& v : x) {
-        sum += v.get();
-      }
-    }
-    return sum;
-  };
-  ret.allocAttempts = accum(*allocAttempts);
-  ret.evictionAttempts = accum(*evictionAttempts);
-  ret.allocFailures = accum(*allocFailures);
-  ret.numEvictions = accum(*chainedItemEvictions);
-  ret.numEvictions += accum(*regularItemEvictions);
 
   ret.invalidAllocs = invalidAllocs.get();
   ret.numRefcountOverflow = numRefcountOverflow.get();

@@ -1626,6 +1626,13 @@ class CacheAllocator : public CacheBase {
 
   MMContainer& getMMContainer(PoolId pid, ClassId cid) const noexcept;
 
+  // Fragmentation bytes for a class; a read racing alloc/free on other
+  // threads can transiently underflow the thread-local sum, so clamp to 0.
+  uint64_t fragmentationSizeStat(PoolId pid, ClassId cid) const {
+    const uint64_t v = (*stats_.fragmentationSize)[pid][cid].get();
+    return static_cast<int64_t>(v) < 0 ? 0 : v;
+  }
+
   // create a new cache allocation. The allocation can be initialized
   // appropriately and made accessible through insert or insertOrReplace.
   // If the handle returned from this api is not passed on to
@@ -5418,7 +5425,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
            {allocSizes[cid], (*stats_.allocAttempts)[poolId][cid].get(),
             (*stats_.evictionAttempts)[poolId][cid].get(),
             (*stats_.allocFailures)[poolId][cid].get(),
-            (*stats_.fragmentationSize)[poolId][cid].get(), classHits,
+            fragmentationSizeStat(poolId, cid), classHits,
             (*stats_.chainedItemEvictions)[poolId][cid].get(),
             (*stats_.regularItemEvictions)[poolId][cid].get(),
             mmContainers_[poolId][cid]->getStats()}
@@ -6355,6 +6362,20 @@ GlobalCacheStats CacheAllocator<CacheTrait>::getGlobalCacheStats() const {
 
   GlobalCacheStats ret{};
   stats_.populateGlobalCacheStats(ret);
+
+  // Sum only existing pools and classes: reading a TLCounter allocates a
+  // thread-local id, so walking all kMaxPools x kMaxClasses would bloat every
+  // thread's id table.
+  for (const auto pid : allocator_->getPoolIds()) {
+    const auto& pool = allocator_->getPool(pid);
+    for (unsigned int cid = 0; cid < pool.getNumClassId(); ++cid) {
+      ret.allocAttempts += (*stats_.allocAttempts)[pid][cid].get();
+      ret.evictionAttempts += (*stats_.evictionAttempts)[pid][cid].get();
+      ret.allocFailures += (*stats_.allocFailures)[pid][cid].get();
+      ret.numEvictions += (*stats_.chainedItemEvictions)[pid][cid].get() +
+                          (*stats_.regularItemEvictions)[pid][cid].get();
+    }
+  }
 
   ret.numItems = accessContainer_->getStats().numKeys;
 

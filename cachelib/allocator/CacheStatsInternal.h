@@ -52,7 +52,7 @@ struct Stats {
   TLCounter numCacheRemoveRamHits{0};
 
   // number of evictions where items leave both RAM and NvmCache entirely
-  AtomicCounter numCacheEvictions{0};
+  TLCounter numCacheEvictions{0};
 
   // number of item destructor calls from ram
   TLCounter numRamDestructorCalls{0};
@@ -231,10 +231,13 @@ struct Stats {
 
   // hit count for every alloc class in every pool
   std::unique_ptr<PerPoolClassTLCounters> cacheHits{};
-  std::unique_ptr<PerPoolClassAtomicCounters> allocAttempts{};
-  std::unique_ptr<PerPoolClassAtomicCounters> evictionAttempts{};
-  std::unique_ptr<PerPoolClassAtomicCounters> allocFailures{};
-  std::unique_ptr<PerPoolClassAtomicCounters> fragmentationSize{};
+  std::unique_ptr<PerPoolClassTLCounters> allocAttempts{};
+  std::unique_ptr<PerPoolClassTLCounters> evictionAttempts{};
+  std::unique_ptr<PerPoolClassTLCounters> allocFailures{};
+  // added on alloc and subtracted on free, possibly by different threads, so
+  // per-thread values wrap; the sum is exact once quiesced but a racing read
+  // can transiently underflow.
+  std::unique_ptr<PerPoolClassTLCounters> fragmentationSize{};
   std::unique_ptr<PerPoolClassAtomicCounters> chainedItemEvictions{};
   std::unique_ptr<PerPoolClassAtomicCounters> regularItemEvictions{};
 
