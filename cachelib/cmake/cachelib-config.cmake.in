@@ -33,7 +33,7 @@ find_dependency(Gflags)
 find_dependency(folly )
 find_dependency(fizz )
 find_dependency(wangle)
-find_dependency(FBThrift)
+find_dependency(thrift CONFIG)
 
 if (NOT TARGET cachelib)
 	include("${CACHELIB_CMAKE_DIR}/cachelib-targets.cmake")

@@ -38,9 +38,9 @@ find_library(XXHASH_LIBRARY xxhash)
 
 target_link_libraries(cachelib_common PUBLIC
   Threads::Threads
-  FBThrift::thriftcpp2
-  FBThrift::thriftprotocol
-  FBThrift::thrift_dynamic_value
+  thrift::rpc
+  thrift::protocol
+  thrift::dynamic_value
   Folly::folly
   Folly::follybenchmark
   Folly::folly_debugging_exception_tracer_exception_tracer

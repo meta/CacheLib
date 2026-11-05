@@ -65,8 +65,6 @@ set(CMAKE_MODULE_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/../build/fbcode_builder/CMake"
   ${CMAKE_MODULE_PATH})
 
-include(FBThriftLibrary)
-
 # When installing the library (and dependencies like folly) in a non-default
 # prefix, this will let projects linking against *.so to find libfolly.so
 # automatically.
@@ -119,7 +117,7 @@ find_package(fmt CONFIG REQUIRED)
 find_package(wangle CONFIG REQUIRED)
 find_package(Zlib REQUIRED)
 find_package(Zstd REQUIRED)
-find_package(FBThrift REQUIRED) # must come after wangle
+find_package(thrift CONFIG REQUIRED)
 find_package(NUMA REQUIRED)
 find_package(Sparsemap REQUIRED)
 find_package(magic_enum CONFIG REQUIRED)
@@ -292,7 +290,7 @@ function(add_thrift_file PREFIX THRIFT_RELATIVE_PATH CPP_OPTION)
        ${${PREFIX}_THRIFT_FILES}
     COMMAND
        ${FBTHRIFT1} -o ${FOOM} --gen mstch_cpp2:${CPP_OPTION}
-                    -I "${FBTHRIFT_INCLUDE_DIR}" -I ${CACHELIB_HOME}/..
+                    -I "${THRIFT_INCLUDE_DIR}" -I ${CACHELIB_HOME}/..
                     ${THRIFT_BASENAME}
     DEPENDS
        ${THRIFT_RELATIVE_PATH}
