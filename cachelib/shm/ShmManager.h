@@ -18,18 +18,14 @@
 
 #include <folly/File.h>
 #include <folly/container/F14Map.h>
-#include <folly/hash/Hash.h>
 #include <xxhash.h>
 
 #include <fstream>
 #include <memory>
 #include <string>
 
-#include "cachelib/common/AtomicCounter.h"
 #include "cachelib/common/Utils.h"
 #include "cachelib/shm/Shm.h"
-
-class ShmManagerTest;
 
 namespace facebook {
 namespace cachelib {
@@ -167,12 +163,7 @@ class ShmManager {
       const PageSize& pageSize = PageSize(),
       const std::string& hugePageMountDir = "");
 
-  // Returns the number of segments attached using the old (fnv64_BROKEN) hash.
-  // This is used to track migration progress from fnv64_BROKEN to xxhash3.
-  static uint64_t getNumOldHashAttaches() { return numOldHashAttaches_.get(); }
-
  private:
-  friend class ::ShmManagerTest;
   enum class ShmVal : int8_t { SHM_SYS_V = 1, SHM_POSIX, SHM_INVALID };
 
   // if metadata file exists, truncates it. If it does not exist, creates an
@@ -228,34 +219,8 @@ class ShmManager {
     return name + dirHash_;
   }
 
-  // Returns the segment identifier using the old (BROKEN) hash. Used during
-  // migration to find segments created before the xxhash3 switch.
-  std::string oldUniqueIdForName(const std::string& name) const {
-    return name + oldDirHash_;
-  }
-
-  // Static overloads used by static methods that don't have access to the
-  // precomputed dirHash_/oldDirHash_ members.
-  static std::string uniqueIdForName(const std::string& name,
-                                     const std::string& cacheDir) {
-    return name + std::to_string(XXH3_64bits(cacheDir.data(), cacheDir.size()));
-  }
-
-  static std::string oldUniqueIdForName(const std::string& name,
-                                        const std::string& cacheDir) {
-    return name + std::to_string(folly::hash::fnv64_BROKEN(cacheDir));
-  }
-
   std::string controlDir_{};
   std::string dirHash_{};
-  // Hash computed with fnv64_BROKEN for backward compatibility. Can be removed
-  // once all segments have been recreated with xxhash3.
-  std::string oldDirHash_{};
-
-  // Counter for the number of segments attached using the old hash.
-  // Used to track migration progress. Static so it can be incremented from
-  // static methods like attachShmReadOnly().
-  static AtomicCounter numOldHashAttaches_;
 
   // current segment being managed by this instance
   folly::F14FastMap<std::string, std::unique_ptr<ShmSegment>> segments_{};

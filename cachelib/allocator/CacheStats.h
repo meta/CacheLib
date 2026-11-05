@@ -590,10 +590,6 @@ struct GlobalCacheStats {
   // Number of times "expensive" cachelib stats are polled. This is useful as
   // polling these stats can be expensive. We shouldn't do it too often.
   uint64_t numExpensiveStatsPolled{0};
-
-  // Number of shm segments attached using the old fnv64_BROKEN hash.
-  // Used to track migration progress from fnv64_BROKEN to xxhash3.
-  uint64_t numShmOldHashAttaches{0};
 };
 
 struct CacheMemoryStats {

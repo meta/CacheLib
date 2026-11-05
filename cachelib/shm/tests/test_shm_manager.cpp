@@ -27,6 +27,7 @@
 
 #include "cachelib/common/Utils.h"
 #include "cachelib/shm/PosixShmSegment.h"
+#include "cachelib/shm/Shm.h"
 #include "cachelib/shm/ShmCommon.h"
 #include "cachelib/shm/ShmManager.h"
 #include "cachelib/shm/gen-cpp2/shm_types.h"
@@ -37,7 +38,6 @@ using namespace facebook::cachelib::tests;
 
 using facebook::cachelib::ShmAttach;
 using facebook::cachelib::ShmManager;
-using facebook::cachelib::ShmNew;
 using facebook::cachelib::ShmSegment;
 
 using ShutDownRes = typename facebook::cachelib::ShmManager::ShutDownRes;
@@ -90,8 +90,6 @@ class ShmManagerTest : public ShmTestBase {
   void testAttachReadOnly(bool posix);
   void testMetaFileDeletion(bool posix);
   void testHugePageMountConfig(const std::string& configuredMount);
-  void testHashMigrationWarmRoll(bool posix);
-  void testHashMigrationColdStart(bool posix);
 
  private:
   const static std::string dirPrefix;
@@ -945,11 +943,6 @@ void ShmManagerTest::testHugePageMountConfig(
   const std::string segmentName = "mount-change";
   const std::string persistedMount = cacheDir + "-persisted-mount";
   const bool mountChanged = persistedMount != configuredMount;
-  const std::string newId = ShmManager::uniqueIdForName(segmentName, cacheDir);
-  const std::string oldId =
-      ShmManager::oldUniqueIdForName(segmentName, cacheDir);
-  const std::string persistedPath = persistedMount + "/" + newId;
-  const std::string configuredPath = configuredMount + "/" + oldId;
 
   facebook::cachelib::util::makeDir(cacheDir);
   facebook::cachelib::util::makeDir(persistedMount);
@@ -957,10 +950,22 @@ void ShmManagerTest::testHugePageMountConfig(
     facebook::cachelib::util::makeDir(configuredMount);
   }
 
+  std::string segmentKey;
+  {
+    ShmManager manager(cacheDir, true, persistedMount);
+    manager.createShm(segmentName, getRandomSize());
+    segmentKey = manager.getShmByName(segmentName).getKeyStr();
+    ASSERT_EQ(ShutDownRes::kSuccess, manager.shutDown());
+  }
+  const std::string persistedPath = persistedMount + segmentKey;
+  const std::string configuredPath = configuredMount + segmentKey;
+
   SCOPE_EXIT {
     try {
-      facebook::cachelib::PosixShmSegment::removeByName(newId, persistedMount);
-      facebook::cachelib::PosixShmSegment::removeByName(oldId, configuredMount);
+      facebook::cachelib::PosixShmSegment::removeByName(segmentKey,
+                                                        persistedMount);
+      facebook::cachelib::PosixShmSegment::removeByName(segmentKey,
+                                                        configuredMount);
       facebook::cachelib::util::removePath(persistedMount);
       if (!configuredMount.empty() && configuredMount != persistedMount) {
         facebook::cachelib::util::removePath(configuredMount);
@@ -978,21 +983,6 @@ void ShmManagerTest::testHugePageMountConfig(
     ASSERT_TRUE(file.good());
   }
 
-  ShmSegment tmpfsSegment(ShmNew, newId, getRandomSize(), true);
-
-  facebook::cachelib::serialization::ShmManagerObject object;
-  *object.shmVal() = static_cast<int8_t>(ShmManager::ShmVal::SHM_POSIX);
-  (*object.nameToKeyMap())[segmentName] = tmpfsSegment.getKeyStr();
-  object.hugePageMountDir() = persistedMount;
-  std::string buf;
-  apache::thrift::BinarySerializer::serialize(object, &buf);
-  {
-    std::ofstream metadata(cacheDir + "/metadata", std::ios::trunc);
-    metadata << buf;
-    metadata.flush();
-    ASSERT_TRUE(metadata.good());
-  }
-
   {
     ShmManager manager(cacheDir, true, configuredMount);
     if (mountChanged) {
@@ -1000,7 +990,7 @@ void ShmManagerTest::testHugePageMountConfig(
       if (!configuredMount.empty()) {
         EXPECT_TRUE(facebook::cachelib::util::pathExists(configuredPath));
       }
-      EXPECT_THROW(ShmSegment(ShmAttach, newId, true), std::system_error);
+      EXPECT_THROW(ShmSegment(ShmAttach, segmentKey, true), std::system_error);
       EXPECT_THROW(manager.attachShm(segmentName), std::invalid_argument);
     } else {
       EXPECT_TRUE(facebook::cachelib::util::pathExists(persistedPath));
@@ -1020,8 +1010,7 @@ void ShmManagerTest::testHugePageMountConfig(
     EXPECT_TRUE(persistedObject.nameToKeyMap()->empty());
   } else {
     ASSERT_EQ(1, persistedObject.nameToKeyMap()->size());
-    EXPECT_EQ(tmpfsSegment.getKeyStr(),
-              persistedObject.nameToKeyMap()->at(segmentName));
+    EXPECT_EQ(segmentKey, persistedObject.nameToKeyMap()->at(segmentName));
   }
   if (configuredMount.empty()) {
     EXPECT_FALSE(persistedObject.hugePageMountDir().has_value());
@@ -1041,227 +1030,4 @@ TEST_F(ShmManagerTestPosix, ChangingHugePageMountStartsFresh) {
 
 TEST_F(ShmManagerTestPosix, UnchangedHugePageMountReattaches) {
   testHugePageMountConfig(cacheDir + "-persisted-mount");
-}
-
-// Verify that ShmManager can attach to segments created with the old
-// (fnv64_BROKEN) hash, but that newly created segments use the new (xxhash3)
-// hash.
-void ShmManagerTest::testHashMigrationWarmRoll(bool posix) {
-  // fnv64_BROKEN and xxhash3 produce different hashes for any input.
-  // Use a path with a high byte to be safe.
-  const std::string migrationDir = cacheDir + std::string(1, '\x80');
-  SCOPE_EXIT {
-    try {
-      facebook::cachelib::util::removePath(migrationDir);
-    } catch (...) {
-    }
-  };
-
-  ASSERT_NE(
-      std::to_string(folly::hash::fnv64_BROKEN(migrationDir)),
-      std::to_string(XXH3_64bits(migrationDir.data(), migrationDir.size())))
-      << "Hashes must differ for migration test to be meaningful";
-
-  const std::string seg1 = "migrate-1";
-  const std::string seg2 = "migrate-2";
-  const std::string segNew = "migrate-new";
-  const size_t size = getRandomSize();
-  const unsigned char magicVal1 = 'O'; // "Old"
-  const unsigned char magicVal2 = 'L';
-
-  const std::string oldId1 = ShmManager::oldUniqueIdForName(seg1, migrationDir);
-  const std::string oldId2 = ShmManager::oldUniqueIdForName(seg2, migrationDir);
-  const std::string newId1 = ShmManager::uniqueIdForName(seg1, migrationDir);
-  const std::string newId2 = ShmManager::uniqueIdForName(seg2, migrationDir);
-
-  // Phase 1: Simulate a pre-migration process by creating segments with the
-  // old (BROKEN) hash and writing a valid metadata file.
-  {
-    facebook::cachelib::util::makeDir(migrationDir);
-
-    ShmSegment s1(ShmNew, oldId1, size, posix);
-    ASSERT_TRUE(s1.mapAddress(nullptr));
-    writeToMemory(s1.getCurrentMapping().addr, s1.getCurrentMapping().size,
-                  magicVal1);
-    auto key1 = s1.getKeyStr();
-
-    ShmSegment s2(ShmNew, oldId2, size, posix);
-    ASSERT_TRUE(s2.mapAddress(nullptr));
-    writeToMemory(s2.getCurrentMapping().addr, s2.getCurrentMapping().size,
-                  magicVal2);
-    auto key2 = s2.getKeyStr();
-
-    // Detach mappings (segments remain in the kernel).
-    s1.detachCurrentMapping();
-    s2.detachCurrentMapping();
-
-    // Write a metadata file as if a pre-migration ShmManager had shut down.
-    facebook::cachelib::serialization::ShmManagerObject object;
-    *object.shmVal() = static_cast<int8_t>(
-        posix ? facebook::cachelib::ShmManager::ShmVal::SHM_POSIX
-              : facebook::cachelib::ShmManager::ShmVal::SHM_SYS_V);
-    (*object.nameToKeyMap())[seg1] = key1;
-    (*object.nameToKeyMap())[seg2] = key2;
-    std::string buf;
-    apache::thrift::BinarySerializer::serialize(object, &buf);
-    std::ofstream f(migrationDir + "/metadata", std::ios::trunc);
-    f << buf;
-    f.flush();
-    f.close();
-  }
-
-  // Phase 2: Create a new ShmManager. It should attach to the old-hash
-  // segments, but any newly created segment should use the new hash.
-  {
-    ShmManager s(migrationDir, posix);
-    auto baseline = ShmManager::getNumOldHashAttaches();
-
-    // Attach to old-hash segments - should succeed via fallback.
-    auto m1 = s.attachShm(seg1);
-    checkMemory(m1.addr, m1.size, magicVal1);
-    ASSERT_EQ(baseline + 1, ShmManager::getNumOldHashAttaches());
-
-    auto m2 = s.attachShm(seg2);
-    checkMemory(m2.addr, m2.size, magicVal2);
-    ASSERT_EQ(baseline + 2, ShmManager::getNumOldHashAttaches());
-
-    // Create a brand-new segment (e.g. shm_info on first warm roll after
-    // migration). This should now use the new hash.
-    s.createShm(segNew, size);
-    ASSERT_EQ(baseline + 2, ShmManager::getNumOldHashAttaches());
-
-    // Verify: old segments still exist under old hash names.
-    ASSERT_NO_THROW(ShmSegment(ShmAttach, oldId1, posix));
-    ASSERT_NO_THROW(ShmSegment(ShmAttach, oldId2, posix));
-
-    // Verify: old segments do NOT exist under new hash names (they were never
-    // recreated).
-    ASSERT_THROW(ShmSegment(ShmAttach, newId1, posix), std::system_error);
-    ASSERT_THROW(ShmSegment(ShmAttach, newId2, posix), std::system_error);
-
-    // Verify: new segment exists under the new hash name only (write path
-    // now uses xxhash3).
-    ASSERT_NO_THROW(ShmSegment(
-        ShmAttach, ShmManager::uniqueIdForName(segNew, migrationDir), posix));
-    ASSERT_THROW(
-        ShmSegment(ShmAttach,
-                   ShmManager::oldUniqueIdForName(segNew, migrationDir), posix),
-        std::system_error);
-
-    ASSERT_TRUE(s.shutDown() == ShutDownRes::kSuccess);
-  }
-
-  // Phase 3: Attach again after shutdown. Old segments should still be
-  // reachable (their keys were persisted), and the new segment should also
-  // be reachable.
-  {
-    ShmManager s(migrationDir, posix);
-    auto baseline = ShmManager::getNumOldHashAttaches();
-
-    auto m1 = s.attachShm(seg1);
-    checkMemory(m1.addr, m1.size, magicVal1);
-    ASSERT_EQ(baseline + 1, ShmManager::getNumOldHashAttaches());
-
-    auto m2 = s.attachShm(seg2);
-    checkMemory(m2.addr, m2.size, magicVal2);
-    ASSERT_EQ(baseline + 2, ShmManager::getNumOldHashAttaches());
-
-    ASSERT_NO_THROW(s.attachShm(segNew));
-    // segNew was created with new hash, so attaching to it should NOT increment
-    // the counter
-    ASSERT_EQ(baseline + 2, ShmManager::getNumOldHashAttaches());
-
-    ASSERT_TRUE(s.shutDown() == ShutDownRes::kSuccess);
-  }
-
-  // Clean up segments.
-  ShmManager::removeByName(migrationDir, seg1, posix);
-  ShmManager::removeByName(migrationDir, seg2, posix);
-  ShmManager::removeByName(migrationDir, segNew, posix);
-}
-
-TEST_F(ShmManagerTestPosix, HashMigrationWarmRoll) {
-  testHashMigrationWarmRoll(true /* posix */);
-}
-
-TEST_F(ShmManagerTestSysV, HashMigrationWarmRoll) {
-  testHashMigrationWarmRoll(false /* posix */);
-}
-
-// Verify that when shared memory segments are wiped (simulating a machine
-// restart), all segments are created with the new (xxhash3) hash.
-void ShmManagerTest::testHashMigrationColdStart(bool posix) {
-  // Use a path with a high byte so fnv64_BROKEN != xxhash3.
-  const std::string migrationDir = cacheDir + std::string(1, '\x80');
-  SCOPE_EXIT {
-    try {
-      facebook::cachelib::util::removePath(migrationDir);
-    } catch (...) {
-    }
-  };
-
-  const std::string seg1 = "cold-1";
-  const std::string seg2 = "cold-2";
-  const size_t size = getRandomSize();
-  const unsigned char magicVal = 'N'; // "New"
-
-  const std::string oldId1 = ShmManager::oldUniqueIdForName(seg1, migrationDir);
-  const std::string oldId2 = ShmManager::oldUniqueIdForName(seg2, migrationDir);
-  const std::string newId1 = ShmManager::uniqueIdForName(seg1, migrationDir);
-  const std::string newId2 = ShmManager::uniqueIdForName(seg2, migrationDir);
-
-  // No pre-existing segments - fresh start (simulates machine restart where
-  // shared memory was wiped).
-  {
-    ShmManager s(migrationDir, posix);
-    auto baseline = ShmManager::getNumOldHashAttaches();
-
-    auto m1 = s.createShm(seg1, size);
-    writeToMemory(m1.addr, m1.size, magicVal);
-
-    auto m2 = s.createShm(seg2, size);
-    writeToMemory(m2.addr, m2.size, magicVal + 1);
-
-    ASSERT_EQ(baseline, ShmManager::getNumOldHashAttaches());
-
-    // Verify: segments exist under new hash names only (write path now uses
-    // xxhash3).
-    ASSERT_NO_THROW(ShmSegment(ShmAttach, newId1, posix));
-    ASSERT_NO_THROW(ShmSegment(ShmAttach, newId2, posix));
-
-    // Verify: segments do NOT exist under old hash names.
-    ASSERT_THROW(ShmSegment(ShmAttach, oldId1, posix), std::system_error);
-    ASSERT_THROW(ShmSegment(ShmAttach, oldId2, posix), std::system_error);
-
-    ASSERT_TRUE(s.shutDown() == ShutDownRes::kSuccess);
-  }
-
-  // Re-attach after shutdown - should work using new hash.
-  {
-    ShmManager s(migrationDir, posix);
-    auto baseline = ShmManager::getNumOldHashAttaches();
-
-    auto m1 = s.attachShm(seg1);
-    checkMemory(m1.addr, m1.size, magicVal);
-    // Attaching to new-hash segment should NOT increment counter
-    ASSERT_EQ(baseline, ShmManager::getNumOldHashAttaches());
-
-    auto m2 = s.attachShm(seg2);
-    checkMemory(m2.addr, m2.size, magicVal + 1);
-    ASSERT_EQ(baseline, ShmManager::getNumOldHashAttaches());
-
-    ASSERT_TRUE(s.shutDown() == ShutDownRes::kSuccess);
-  }
-
-  // Clean up segments.
-  ShmManager::removeByName(migrationDir, seg1, posix);
-  ShmManager::removeByName(migrationDir, seg2, posix);
-}
-
-TEST_F(ShmManagerTestPosix, HashMigrationColdStart) {
-  testHashMigrationColdStart(true);
-}
-
-TEST_F(ShmManagerTestSysV, HashMigrationColdStart) {
-  testHashMigrationColdStart(false);
 }
