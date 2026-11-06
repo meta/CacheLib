@@ -20,6 +20,7 @@
 
 #include "cachelib/common/Hash.h"
 #include "cachelib/navy/common/Buffer.h"
+#include "cachelib/navy/common/ChecksumType.h"
 
 namespace facebook {
 namespace cachelib {
@@ -27,8 +28,13 @@ namespace navy {
 // Default hash function
 uint64_t hashBuffer(BufferView key, uint64_t seed = 0);
 
-// Default checksumming function
+// CRC-32 (IEEE) with raw seed semantics (no final inversion).
 uint32_t checksum(BufferView data, uint32_t startingChecksum = 0);
+
+// The selected polynomial with raw seed semantics (no final inversion).
+uint32_t checksum(BufferView data,
+                  ChecksumType type,
+                  uint32_t startingChecksum = 0);
 
 // Convenience utils to convert a piece of buffer to a hashed key
 inline HashedKey makeHK(const void* ptr, size_t size) {

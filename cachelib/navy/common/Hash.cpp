@@ -18,6 +18,8 @@
 
 #include <folly/hash/Checksum.h>
 
+#include <stdexcept>
+
 namespace facebook::cachelib::navy {
 uint64_t hashBuffer(BufferView key, uint64_t seed) {
   return folly::hash::SpookyHashV2::Hash64(key.data(), key.size(), seed);
@@ -25,5 +27,18 @@ uint64_t hashBuffer(BufferView key, uint64_t seed) {
 
 uint32_t checksum(BufferView data, uint32_t startingChecksum) {
   return folly::crc32(data.data(), data.size(), startingChecksum);
+}
+
+uint32_t checksum(BufferView data,
+                  ChecksumType type,
+                  uint32_t startingChecksum) {
+  switch (type) {
+  case ChecksumType::Crc32:
+    return checksum(data, startingChecksum);
+  case ChecksumType::Crc32c:
+    return folly::crc32c(data.data(), data.size(), startingChecksum);
+  default:
+    throw std::invalid_argument("invalid checksum type");
+  }
 }
 } // namespace facebook::cachelib::navy
