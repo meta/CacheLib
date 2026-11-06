@@ -40,7 +40,9 @@ releases one slab from the victim and either gives it to the receiver in the
 same pool or returns it to the pool's free slab list. Active items on the
 selected slab are either copied into new allocations through the
 `enableMovingOnSlabRelease()` callback (Cachelib refers to this as *moving*),
-or evicted if they cannot be relocated.
+or evicted if they cannot be relocated. Whenever possible, use a move callback
+via `enableMovingOnSlabRelease()` so the remaining live items on a released slab
+are relocated instead of evicted.
 
 A successful strategy action moves one slab, or 4 MB, per pool per interval, so
 with multiple regular pools the total movement scales linearly with pool count.
@@ -92,6 +94,15 @@ config.enablePoolRebalancing(
 You can also override the rebalance strategy for a specific pool by passing a
 strategy to `addPool()` or by calling `overridePoolRebalanceStrategy()`.
 
+**Reclaiming first from mostly-free allocation classes:**
+`poolRebalancerFreeAllocThreshold` controls a `PoolRebalancer`-level pre-pass
+that runs before the strategy (see below) on every interval. Any class whose
+`freeAllocs / allocsPerSlab` (slab's worth of free space) exceeds the threshold
+is eligible, and the eligible class with the most free space releases one slab
+back to the pool with no receiver. `0` (the default) disables it; `1` means "at
+least two slab's worth of free slots". Unlike the strategy path, it does not
+require the pool to be full.
+
 ### Picking a strategy
 
 Cachelib offers a few pre-packaged strategies for rebalancing that you can pick
@@ -120,13 +131,19 @@ with the youngest eviction age as the receiver.
 You can configure the following parameters in `LruTailAgeStrategy::Config`:
 
 * `tailAgeDifferenceRatio`
-This defines how tight the tail age of various object sizes you want them to be. Setting it to 0.1 means that you don't want the min and max age to differ by more than 10%.
+This defines how tight the tail age of various object sizes you want them to be.
+Setting it to 0.1 means that you don't want the min and max age to differ by
+more than 10%.
 
 * `minTailAgeDifference`
-This specifies a threshold of how big the actual diff ratio should be to warrant a rebalancing. For example, your min and max might be more than 10% off, but the real difference is insignificant.
+This specifies a threshold of how big the actual diff ratio should be to warrant
+a rebalancing. For example, your min and max might be more than 10% off, but the
+real difference is insignificant.
 
 * `minSlabs`
-This specifies the minimum amount of memory in slabs that specific object size can not go below while rebalancing. Keep in mind that this is specified in slabs and not in bytes.
+This specifies the minimum amount of memory in slabs that specific object size
+can not go below while rebalancing. Keep in mind that this is specified in slabs
+and not in bytes.
 
 * `numSlabsFreeMem`
   If an allocation class has more than this many slabs worth of free memory
@@ -163,7 +180,11 @@ config.enablePoolRebalancing(std::move(rebalanceStrategy), std::chrono::seconds(
 
 #### Hits per slab
 
-`HitsPerSlabStrategy` tries to optimize the overall hit ratio rather than ensuring a fairness in the cache eviction age. This should result in a relatively higher hit ratio. However, it might potentially make your cache contain more of objects that give hits vs. objects that are expensive to recompute. For example, the cost of miss on objects is not uniform.
+`HitsPerSlabStrategy` tries to optimize the overall hit ratio rather than
+ensuring a fairness in the cache eviction age. This should result in a
+relatively higher hit ratio. However, it might potentially make your cache
+contain more of objects that give hits vs. objects that are expensive to
+recompute. For example, the cost of miss on objects is not uniform.
 
 You can configure the following parameters in `HitsPerSlabStrategy::Config`:
 
@@ -208,7 +229,12 @@ You can configure the following parameters in `HitsPerSlabStrategy::Config`:
 
 #### Marginal hits
 
-This strategy ensures that the marginal hits (estimated by the hits in the tail part of LRU) across different object sizes are similar. Unlike hit based strategy which counts for historical count of hits across the entire cache, this tracks which objects could marginally benefit from getting more memory. To enable this,  you need to use the MM2Q eviction policy and enable tail hits tracking (`Allocator::Config::enableTailHitsTracking()`).
+This strategy ensures that the marginal hits (estimated by the hits in the tail
+part of LRU) across different object sizes are similar. Unlike hit based
+strategy which counts for historical count of hits across the entire cache, this
+tracks which objects could marginally benefit from getting more memory. To
+enable this,  you need to use the MM2Q eviction policy and enable tail hits
+tracking (`Allocator::Config::enableTailHitsTracking()`).
 
 You can configure the following parameters in `MarginalHitsStrategy::Config`:
 
@@ -226,23 +252,32 @@ You can configure the following parameters in `MarginalHitsStrategy::Config`:
 
 #### Free memory
 
-This strategy frees a slab from an allocation class that satisfies all of the following requirements:
+This strategy frees a slab from an allocation class that satisfies all of the
+following requirements:
 - this allocation class has total slabs above `minSlabs`
-- this allocation class has more than `numFreeSlabs` slab equivalents of total free memory
-- this allocation class has the most total free memory among all non-evicting (i.e. no eviction is currently happening) allocation classes in the pool
+- this allocation class has more than `numFreeSlabs` slab equivalents of total
+free memory
+- this allocation class has the most total free memory among all non-evicting
+(i.e. no eviction is currently happening) allocation classes in the pool
 
-Note: this strategy does not specify a target allocation class to receive the freed slab.
-You can configure the following parameters in `FreeMemStrategy::Config`:
+Note: this strategy does not specify a target allocation class to receive the
+freed slab.  You can configure the following parameters in
+`FreeMemStrategy::Config`:
 * `minSlabs`
 The minimum number of slabs to retain in every allocation class. Default is 1.
 * `numFreeSlabs`
 The free-memory threshold, in slab equivalents. Default is 3.
 * `maxUnAllocatedSlabs`
-FreeMem strategy will not rebalance anything if the number of free slabs in this pool is more than this number. Default is 1000.
+FreeMem strategy will not rebalance anything if the number of free slabs in this
+pool is more than this number. Default is 1000.
 
 ### Writing your own strategy
 
-In addition, if you have some application specific context on how you can improve your cache, you can implement your own strategy and pass it to cachelib for rebalancing. Your rebalancing strategy will have to extend the type `RebalanceStrategy` and implement the following two methods that define where to take memory from and where to give more memory to:
+In addition, if you have some application specific context on how you can
+improve your cache, you can implement your own strategy and pass it to cachelib
+for rebalancing. Your rebalancing strategy will have to extend the type
+`RebalanceStrategy` and implement the following two methods that define where to
+take memory from and where to give more memory to:
 
 
 ```cpp

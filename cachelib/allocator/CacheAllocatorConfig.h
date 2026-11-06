@@ -640,7 +640,7 @@ class CacheAllocatorConfig {
   unsigned int poolRebalancerFreeAllocThreshold{0};
 
   // rebalancing strategy for all pools. By default the strategy will
-  // rebalance to avoid alloc fialures.
+  // rebalance to avoid alloc failures.
   std::shared_ptr<RebalanceStrategy> defaultPoolRebalanceStrategy{
       new RebalanceStrategy{}};
 
