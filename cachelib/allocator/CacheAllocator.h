@@ -1636,6 +1636,12 @@ class CacheAllocator : public CacheBase {
 
   void createMMContainers(const PoolId pid, MMConfig config);
 
+  // Tail size of one shard of the MM container of (pool, cid), 0 unless tail
+  // hits are tracked. The shards' tails add up to one slab's worth of items.
+  size_t getMMContainerTailSize(const MemoryPool& pool,
+                                ClassId cid,
+                                uint32_t shard) const;
+
   void initMMContainerShardSet(PoolId pid, ClassId cid);
 
   bool isMMContainerSharded() const noexcept {
@@ -5479,16 +5485,14 @@ void CacheAllocator<CacheTrait>::overridePoolConfig(PoolId pid,
 
   auto& pool = allocator_->getPool(pid);
   for (unsigned int cid = 0; cid < pool.getNumClassId(); ++cid) {
-    MMConfig mmConfig = config;
-    mmConfig.addExtraConfig(
-        config_.trackTailHits
-            ? pool.getAllocationClass(static_cast<ClassId>(cid))
-                  .getAllocsPerSlab()
-            : 0);
     DCHECK_NOTNULL(mmContainers_[pid][cid].get());
-    forEachMMContainerShard(
-        pid, static_cast<ClassId>(cid),
-        [&mmConfig](MMContainer& mm) { mm.setConfig(mmConfig); });
+    for (uint32_t shard = 0; shard < config_.mmContainerShards; ++shard) {
+      MMConfig mmConfig = config;
+      mmConfig.addExtraConfig(
+          getMMContainerTailSize(pool, static_cast<ClassId>(cid), shard));
+      getMMContainerShard(pid, static_cast<ClassId>(cid), shard)
+          .setConfig(mmConfig);
+    }
   }
 }
 
@@ -5498,18 +5502,33 @@ void CacheAllocator<CacheTrait>::createMMContainers(const PoolId pid,
   auto& pool = allocator_->getPool(pid);
   for (unsigned int cid = 0; cid < pool.getNumClassId(); ++cid) {
     config.addExtraConfig(
-        config_.trackTailHits
-            ? pool.getAllocationClass(static_cast<ClassId>(cid))
-                  .getAllocsPerSlab()
-            : 0);
+        getMMContainerTailSize(pool, static_cast<ClassId>(cid), 0));
     mmContainers_[pid][cid].reset(new MMContainer(config, compressor_));
     if (isMMContainerSharded()) {
       initMMContainerShardSet(pid, static_cast<ClassId>(cid));
-      for (auto& shard : (*mmContainerShards_)[pid][cid].extraShards) {
-        shard.reset(new MMContainer(config, compressor_));
+      auto& extraShards = (*mmContainerShards_)[pid][cid].extraShards;
+      for (uint32_t shard = 1; shard < config_.mmContainerShards; ++shard) {
+        config.addExtraConfig(
+            getMMContainerTailSize(pool, static_cast<ClassId>(cid), shard));
+        extraShards[shard - 1].reset(new MMContainer(config, compressor_));
       }
     }
   }
+}
+
+template <typename CacheTrait>
+size_t CacheAllocator<CacheTrait>::getMMContainerTailSize(
+    const MemoryPool& pool, ClassId cid, uint32_t shard) const {
+  if (!config_.trackTailHits) {
+    return 0;
+  }
+  // Split one slab's items evenly across the shards; a shard may get 0 and then
+  // doesn't track tail hits. Keep the split stable: each shard persists whether
+  // tracking is on, and attach fails if that changes.
+  const size_t allocsPerSlab = pool.getAllocationClass(cid).getAllocsPerSlab();
+  const uint32_t numShards = config_.mmContainerShards;
+  return allocsPerSlab / numShards +
+         (shard < allocsPerSlab % numShards ? 1 : 0);
 }
 
 template <typename CacheTrait>
@@ -6499,9 +6518,7 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
           std::make_unique<typename MMContainerPtr::element_type>(kv.second,
                                                                   compressor);
       auto config = ptr->getConfig();
-      config.addExtraConfig(config_.trackTailHits
-                                ? pool.getAllocationClass(j).getAllocsPerSlab()
-                                : 0);
+      config.addExtraConfig(getMMContainerTailSize(pool, j, shard));
       ptr->setConfig(config);
       if (shard == 0) {
         mmContainers[i][j] = std::move(ptr);

@@ -432,8 +432,8 @@ class CacheAllocatorConfig {
 
   // Split the MM container of every (pool, allocation class) into this many
   // independently locked shards. Must be a power of two no larger than
-  // kMaxMMContainerShards. Only supported for MMLru. The shard count is
-  // persisted, so changing it forces a cold start on the next attach.
+  // kMaxMMContainerShards. Only supported for MMLru and MM2Q. The shard count
+  // is persisted, so changing it forces a cold start on the next attach.
   CacheAllocatorConfig& setMMContainerShards(uint32_t shards);
 
   // skip promote children items in chained when parent fail to promote
@@ -1452,10 +1452,11 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
         kMaxMMContainerShards,
         mmContainerShards));
   }
-  if (mmContainerShards > 1 && T::MMType::kId != MMLru::kId) {
-    throw std::invalid_argument(
-        fmt::format("mmContainerShards > 1 is only supported for MMLru, not {}",
-                    getEvictionPolicyName()));
+  if (mmContainerShards > 1 && T::MMType::kId != MMLru::kId &&
+      T::MMType::kId != MM2Q::kId) {
+    throw std::invalid_argument(fmt::format(
+        "mmContainerShards > 1 is only supported for MMLru and MM2Q, not {}",
+        getEvictionPolicyName()));
   }
 
   // we don't allow user to enable both RemoveCB and ItemDestructor

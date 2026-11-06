@@ -69,6 +69,16 @@ class CacheAllocatorTestWrapper {
         pid, cid, [&sizes](const auto& mm) { sizes.push_back(mm.size()); });
     return sizes;
   }
+
+  template <class Allocator>
+  static std::vector<size_t> getMMContainerShardTailSizes(
+      const Allocator& alloc, PoolId pid, ClassId cid) {
+    std::vector<size_t> tailSizes;
+    alloc.forEachMMContainerShard(pid, cid, [&tailSizes](const auto& mm) {
+      tailSizes.push_back(mm.getConfig().tailSize);
+    });
+    return tailSizes;
+  }
 };
 
 } // namespace facebook::cachelib::tests

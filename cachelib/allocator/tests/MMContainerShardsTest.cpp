@@ -22,8 +22,10 @@
 #include <chrono>
 #include <cstring>
 #include <numeric>
+#include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -33,76 +35,94 @@
 
 namespace facebook::cachelib::tests {
 namespace {
-using AllocatorT = LruAllocator;
-using Item = AllocatorT::Item;
-
 constexpr uint32_t kNumShards = 4;
 // a single allocation class, so every item shares one sharded MM container
 constexpr uint32_t kAllocSize = 1024;
 constexpr uint32_t kValueSize = 900;
 constexpr ClassId kCid = 0;
+
+template <typename AllocatorT>
+typename AllocatorT::Config makeConfig(uint32_t shards) {
+  typename AllocatorT::Config config;
+  config.setCacheSize(10 * Slab::kSize);
+  config.setMMContainerShards(shards);
+  return config;
+}
+
+template <typename AllocatorT>
+PoolId addPool(AllocatorT& alloc) {
+  return alloc.addPool("default", alloc.getCacheMemoryStats().ramCacheSize,
+                       {kAllocSize});
+}
+
+template <typename AllocatorT>
+bool insertItem(AllocatorT& alloc, PoolId pid, const std::string& key) {
+  auto handle = alloc.allocate(pid, key, kValueSize);
+  return handle && alloc.insert(handle);
+}
+
+template <typename AllocatorT>
+std::vector<size_t> shardSizes(const AllocatorT& alloc, PoolId pid) {
+  return CacheAllocatorTestWrapper::getMMContainerShardSizes(alloc, pid, kCid);
+}
+
+size_t sum(const std::vector<size_t>& sizes) {
+  return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+}
+
+template <typename AllocatorT>
+size_t countItems(AllocatorT& alloc) {
+  size_t numItems = 0;
+  for (const auto& item : alloc) {
+    (void)item;
+    ++numItems;
+  }
+  return numItems;
+}
+
+// Stats of the queue that items age into when they are never accessed.
+template <typename AllocatorT>
+const EvictionStatPerType& unaccessedQueueStat(
+    const PoolEvictionAgeStats& stats) {
+  if constexpr (std::is_same_v<typename AllocatorT::MMType, MM2Q>) {
+    return stats.getColdEvictionStat(kCid);
+  } else {
+    return stats.getWarmEvictionStat(kCid);
+  }
+}
 } // namespace
 
-class MMContainerShardsTest : public AllocatorTest<AllocatorT> {
- protected:
-  static AllocatorT::Config makeConfig(uint32_t shards) {
-    AllocatorT::Config config;
-    config.setCacheSize(10 * Slab::kSize);
-    config.setMMContainerShards(shards);
-    return config;
-  }
+template <typename AllocatorT>
+class MMContainerShardsTest : public AllocatorTest<AllocatorT> {};
 
-  static PoolId addPool(AllocatorT& alloc) {
-    return alloc.addPool("default", alloc.getCacheMemoryStats().ramCacheSize,
-                         {kAllocSize});
-  }
+using ShardedAllocatorTypes = ::testing::Types<LruAllocator, Lru2QAllocator>;
+TYPED_TEST_SUITE(MMContainerShardsTest, ShardedAllocatorTypes);
 
-  static bool insertItem(AllocatorT& alloc,
-                         PoolId pid,
-                         const std::string& key) {
-    auto handle = alloc.allocate(pid, key, kValueSize);
-    return handle && alloc.insert(handle);
-  }
-
-  static std::vector<size_t> shardSizes(const AllocatorT& alloc, PoolId pid) {
-    return CacheAllocatorTestWrapper::getMMContainerShardSizes(alloc, pid,
-                                                               kCid);
-  }
-
-  static size_t sum(const std::vector<size_t>& sizes) {
-    return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
-  }
-
-  static size_t countItems(AllocatorT& alloc) {
-    size_t numItems = 0;
-    for (const auto& item : alloc) {
-      (void)item;
-      ++numItems;
-    }
-    return numItems;
-  }
-};
-
-TEST_F(MMContainerShardsTest, ConfigValidation) {
+TYPED_TEST(MMContainerShardsTest, ConfigValidation) {
+  using AllocatorT = TypeParam;
   for (uint32_t shards : {1u, 2u, 64u}) {
-    EXPECT_NO_THROW(makeConfig(shards).validate()) << shards;
+    EXPECT_NO_THROW(makeConfig<AllocatorT>(shards).validate()) << shards;
   }
   for (uint32_t shards : {0u, 3u, 128u}) {
-    EXPECT_THROW(makeConfig(shards).validate(), std::invalid_argument)
+    EXPECT_THROW(makeConfig<AllocatorT>(shards).validate(),
+                 std::invalid_argument)
         << shards;
   }
 
-  Lru2QAllocator::Config config2Q;
-  config2Q.setMMContainerShards(2);
-  EXPECT_THROW(config2Q.validate(), std::invalid_argument);
-  config2Q.setMMContainerShards(1);
-  EXPECT_NO_THROW(config2Q.validate());
-
-  EXPECT_EQ("4", makeConfig(4).serialize()["mmContainerShards"]);
+  EXPECT_EQ("4", makeConfig<AllocatorT>(4).serialize()["mmContainerShards"]);
 }
 
-TEST_F(MMContainerShardsTest, InsertFindReplaceRemove) {
-  AllocatorT alloc(makeConfig(kNumShards));
+TEST(MMContainerShardsConfigTest, RejectsUnsupportedMMType) {
+  TinyLFUAllocator::Config config;
+  config.setMMContainerShards(2);
+  EXPECT_THROW(config.validate(), std::invalid_argument);
+  config.setMMContainerShards(1);
+  EXPECT_NO_THROW(config.validate());
+}
+
+TYPED_TEST(MMContainerShardsTest, InsertFindReplaceRemove) {
+  using AllocatorT = TypeParam;
+  AllocatorT alloc(makeConfig<AllocatorT>(kNumShards));
   const auto pid = addPool(alloc);
 
   constexpr size_t kNumItems = 1000;
@@ -142,14 +162,16 @@ TEST_F(MMContainerShardsTest, InsertFindReplaceRemove) {
             alloc.getPoolStats(pid).cacheStats.at(kCid).containerStat.size);
 }
 
-TEST_F(MMContainerShardsTest, EvictsOldestAcrossShards) {
+TYPED_TEST(MMContainerShardsTest, EvictsOldestAcrossShards) {
+  using AllocatorT = TypeParam;
   std::vector<std::string> evicted;
-  auto config = makeConfig(kNumShards);
-  config.setRemoveCallback([&evicted](const AllocatorT::RemoveCbData& data) {
-    if (data.context == RemoveContext::kEviction) {
-      evicted.push_back(data.item.getKey().str());
-    }
-  });
+  auto config = makeConfig<AllocatorT>(kNumShards);
+  config.setRemoveCallback(
+      [&evicted](const typename AllocatorT::RemoveCbData& data) {
+        if (data.context == RemoveContext::kEviction) {
+          evicted.push_back(data.item.getKey().str());
+        }
+      });
   AllocatorT alloc(config);
   const auto pid = addPool(alloc);
 
@@ -172,8 +194,9 @@ TEST_F(MMContainerShardsTest, EvictsOldestAcrossShards) {
             }));
 }
 
-TEST_F(MMContainerShardsTest, StatsAggregateAcrossShards) {
-  AllocatorT alloc(makeConfig(kNumShards));
+TYPED_TEST(MMContainerShardsTest, StatsAggregateAcrossShards) {
+  using AllocatorT = TypeParam;
+  AllocatorT alloc(makeConfig<AllocatorT>(kNumShards));
   const auto pid = addPool(alloc);
 
   constexpr size_t kNumItems = 1000;
@@ -192,13 +215,14 @@ TEST_F(MMContainerShardsTest, StatsAggregateAcrossShards) {
   EXPECT_LE(containerStat.oldestTimeSec, util::getCurrentTimeSec() - 2);
 
   const auto ageStat =
-      alloc.getPoolEvictionAgeStats(pid, 0).getWarmEvictionStat(kCid);
+      unaccessedQueueStat<AllocatorT>(alloc.getPoolEvictionAgeStats(pid, 0));
   EXPECT_GE(ageStat.oldestElementAge, 2);
   EXPECT_LE(ageStat.projectedAge, ageStat.oldestElementAge);
 }
 
-TEST_F(MMContainerShardsTest, SlabReleaseWithEviction) {
-  AllocatorT alloc(makeConfig(kNumShards));
+TYPED_TEST(MMContainerShardsTest, SlabReleaseWithEviction) {
+  using AllocatorT = TypeParam;
+  AllocatorT alloc(makeConfig<AllocatorT>(kNumShards));
   const auto pid = addPool(alloc);
 
   const size_t numItems = 2 * Slab::kSize / kAllocSize;
@@ -214,8 +238,10 @@ TEST_F(MMContainerShardsTest, SlabReleaseWithEviction) {
   EXPECT_EQ(nullptr, alloc.find("key_0"));
 }
 
-TEST_F(MMContainerShardsTest, SlabReleaseWithMoving) {
-  auto config = makeConfig(kNumShards);
+TYPED_TEST(MMContainerShardsTest, SlabReleaseWithMoving) {
+  using AllocatorT = TypeParam;
+  using Item = typename AllocatorT::Item;
+  auto config = makeConfig<AllocatorT>(kNumShards);
   config.enableMovingOnSlabRelease(
       [](Item& oldItem, Item& newItem, Item* /* parent */) {
         std::memcpy(newItem.getMemory(), oldItem.getMemory(),
@@ -240,8 +266,9 @@ TEST_F(MMContainerShardsTest, SlabReleaseWithMoving) {
   }
 }
 
-TEST_F(MMContainerShardsTest, ConcurrentInsertFindRemove) {
-  AllocatorT alloc(makeConfig(kNumShards));
+TYPED_TEST(MMContainerShardsTest, ConcurrentInsertFindRemove) {
+  using AllocatorT = TypeParam;
+  AllocatorT alloc(makeConfig<AllocatorT>(kNumShards));
   const auto pid = addPool(alloc);
 
   // many more keys than fit, so inserts also evict
@@ -272,9 +299,10 @@ TEST_F(MMContainerShardsTest, ConcurrentInsertFindRemove) {
   EXPECT_EQ(countItems(alloc), sum(shardSizes(alloc, pid)));
 }
 
-TEST_F(MMContainerShardsTest, WarmRollRestoresShards) {
-  auto config = makeConfig(kNumShards);
-  config.enableCachePersistence(cacheDir_);
+TYPED_TEST(MMContainerShardsTest, WarmRollRestoresShards) {
+  using AllocatorT = TypeParam;
+  auto config = makeConfig<AllocatorT>(kNumShards);
+  config.enableCachePersistence(this->cacheDir_);
 
   constexpr size_t kNumItems = 1000;
   std::vector<size_t> savedSizes;
@@ -298,13 +326,15 @@ TEST_F(MMContainerShardsTest, WarmRollRestoresShards) {
   EXPECT_EQ(0, sum(shardSizes(alloc, pid)));
 }
 
-TEST_F(MMContainerShardsTest, WarmRollRefusesChangedShardCount) {
+TYPED_TEST(MMContainerShardsTest, WarmRollRefusesChangedShardCount) {
+  using AllocatorT = TypeParam;
   const std::vector<std::pair<uint32_t, uint32_t>> transitions{
       {4, 2}, {4, 1}, {1, 4}};
   for (const auto& [saved, configured] : transitions) {
-    const auto dir = fmt::format("{}/{}_to_{}", cacheDir_, saved, configured);
+    const auto dir =
+        fmt::format("{}/{}_to_{}", this->cacheDir_, saved, configured);
     util::makeDir(dir);
-    auto config = makeConfig(saved);
+    auto config = makeConfig<AllocatorT>(saved);
     config.enableCachePersistence(dir);
     {
       AllocatorT alloc(AllocatorT::SharedMemNew, config);
@@ -318,5 +348,77 @@ TEST_F(MMContainerShardsTest, WarmRollRefusesChangedShardCount) {
         << saved << " -> " << configured;
     AllocatorT::cleanupStrayShmSegments(dir, config.usePosixShm);
   }
+}
+
+class MM2QContainerShardsTest : public AllocatorTest<Lru2QAllocator> {
+ protected:
+  static size_t countColdTailItems(Lru2QAllocator& alloc) {
+    size_t numItems = 0;
+    for (const auto& item : alloc) {
+      if (alloc.getItemLruType(item) == MM2Q::LruType::ColdTail) {
+        ++numItems;
+      }
+    }
+    return numItems;
+  }
+};
+
+TEST_F(MM2QContainerShardsTest, TailHitsTrackOneSlabAcrossShards) {
+  auto config = makeConfig<Lru2QAllocator>(kNumShards);
+  config.enableTailHitsTracking();
+  config.enableCachePersistence(cacheDir_);
+  constexpr size_t kAllocsPerSlab = Slab::kSize / kAllocSize;
+  // never accessed, so they move from Hot into Cold and fill each cold tail
+  constexpr size_t kNumItems = 4 * kAllocsPerSlab;
+
+  {
+    Lru2QAllocator alloc(Lru2QAllocator::SharedMemNew, config);
+    const auto pid = addPool(alloc);
+    for (size_t i = 0; i < kNumItems; ++i) {
+      ASSERT_TRUE(insertItem(alloc, pid, fmt::format("old_{}", i)));
+    }
+    EXPECT_EQ(kAllocsPerSlab, countColdTailItems(alloc));
+    ASSERT_EQ(Lru2QAllocator::ShutDownStatus::kSuccess, alloc.shutDown());
+  }
+
+  // restored shards keep their share of the tail as they keep filling
+  Lru2QAllocator alloc(Lru2QAllocator::SharedMemAttach, config);
+  const auto pid = alloc.getPoolId("default");
+  for (size_t i = 0; i < kNumItems; ++i) {
+    ASSERT_TRUE(insertItem(alloc, pid, fmt::format("new_{}", i)));
+  }
+  EXPECT_EQ(kAllocsPerSlab, countColdTailItems(alloc));
+}
+
+TEST_F(MM2QContainerShardsTest, TailSizesAddUpToOneSlab) {
+  auto config = makeConfig<Lru2QAllocator>(kNumShards);
+  config.enableTailHitsTracking();
+  config.enableCachePersistence(cacheDir_);
+  // allocs per slab: a multiple of kNumShards (4096), not a multiple (6), and
+  // fewer than kNumShards (2)
+  const std::set<uint32_t> allocSizes{kAllocSize, 600 * 1024, 2 * 1024 * 1024};
+  auto expectOneSlabOfTail = [&allocSizes](const Lru2QAllocator& alloc,
+                                           PoolId pid) {
+    for (const auto allocSize : allocSizes) {
+      const auto cid = alloc.getPool(pid).getAllocationClassId(allocSize);
+      EXPECT_EQ(Slab::kSize / allocSize,
+                sum(CacheAllocatorTestWrapper::getMMContainerShardTailSizes(
+                    alloc, pid, cid)))
+          << allocSize;
+    }
+  };
+
+  {
+    Lru2QAllocator alloc(Lru2QAllocator::SharedMemNew, config);
+    const auto pid = alloc.addPool(
+        "default", alloc.getCacheMemoryStats().ramCacheSize, allocSizes);
+    expectOneSlabOfTail(alloc, pid);
+    alloc.overridePoolConfig(pid, Lru2QAllocator::MMConfig{});
+    expectOneSlabOfTail(alloc, pid);
+    ASSERT_EQ(Lru2QAllocator::ShutDownStatus::kSuccess, alloc.shutDown());
+  }
+
+  Lru2QAllocator alloc(Lru2QAllocator::SharedMemAttach, config);
+  expectOneSlabOfTail(alloc, alloc.getPoolId("default"));
 }
 } // namespace facebook::cachelib::tests
