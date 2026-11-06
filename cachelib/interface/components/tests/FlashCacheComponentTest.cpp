@@ -17,6 +17,8 @@
 #include <folly/coro/GtestHelpers.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include "cachelib/common/Time.h"
 #include "cachelib/interface/components/tests/CacheComponentFactory.h"
 #include "cachelib/interface/tests/Utils.h"
@@ -25,6 +27,75 @@ using namespace facebook::cachelib::interface;
 using namespace facebook::cachelib::interface::test;
 
 namespace {
+
+class ChecksummedFlashCacheFactory : public FlashCacheFactory {
+ public:
+  explicit ChecksummedFlashCacheFactory(
+      facebook::cachelib::navy::ChecksumType checksumType)
+      : checksumType_(checksumType) {}
+
+ protected:
+  Result<std::unique_ptr<CacheComponent>> createWithPersistence(
+      std::unique_ptr<facebook::cachelib::navy::Device> device,
+      FlashCacheComponent::PersistenceConfig persistenceConfig) override {
+    auto config = makeConfig();
+    config.checksum = true;
+    config.checksumType = checksumType_;
+    facebook::cachelib::interface::utils::CoroFiberAdapter::Config
+        executorConfig{
+            .threadName = "checksum_test",
+            .numThreads = 2,
+            .fibersPerThread = 2,
+            .stackSize = 32 * 1024,
+        };
+    auto result = FlashCacheComponent::create("ChecksumTest", std::move(config),
+                                              std::move(device), executorConfig,
+                                              std::move(persistenceConfig));
+    if (result.hasError()) {
+      return folly::makeUnexpected(std::move(result).error());
+    }
+    return std::make_unique<FlashCacheComponent>(std::move(result).value());
+  }
+
+ private:
+  const facebook::cachelib::navy::ChecksumType checksumType_;
+};
+
+CO_TEST(FlashCacheComponent, ChecksumFormatsPersistAndRecover) {
+  using facebook::cachelib::navy::ChecksumType;
+  for (auto checksumType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+    ChecksummedFlashCacheFactory factory(checksumType);
+    auto cache = factory.createPersistent();
+    CO_ASSERT_NE(nullptr, cache);
+    const std::string key = "checksum-key";
+    const std::string original = "original";
+    const std::string replacement = "modified";
+    auto handle = CO_ASSERT_OK(co_await cache->allocate(
+        key, original.size(), facebook::cachelib::util::getCurrentTimeSec(),
+        0));
+    std::memcpy(handle.mutableData(), original.data(), original.size());
+    EXPECT_OK(co_await cache->insert(std::move(handle).release()));
+    {
+      auto writable = CO_ASSERT_OK(co_await cache->findToWrite(key));
+      CO_ASSERT_TRUE(writable.has_value());
+      std::memcpy(writable->mutableData(), replacement.data(),
+                  replacement.size());
+    }
+    EXPECT_OK(cache->shutdown());
+    factory.onShutdown(*cache);
+    cache.reset();
+
+    auto recovered = CO_ASSERT_OK(factory.recover());
+    {
+      auto found = CO_ASSERT_OK(co_await recovered->find(key));
+      CO_ASSERT_TRUE(found.has_value());
+      EXPECT_EQ(
+          replacement,
+          std::string(static_cast<const char*>(found->data()), found->size()));
+    }
+    EXPECT_OK(recovered->shutdown());
+  }
+}
 
 template <typename FactoryType>
 class FlashCacheComponentTest : public ::testing::Test {
@@ -69,8 +140,8 @@ CO_TYPED_TEST(FlashCacheComponentTest, ExpirationCallback) {
   // Fill the cache to force region reclamation, which exercises the
   // checkExpired callback configured in FlashCacheComponent::initConfig().
   for (int i = 0; i < 100; ++i) {
-    auto res = co_await this->cache_->allocate(
-        "fill_" + std::to_string(i), 3000, currentTime, kTTL);
+    auto res = co_await this->cache_->allocate("fill_" + std::to_string(i),
+                                               3000, currentTime, kTTL);
     if (res.hasError()) {
       break;
     }

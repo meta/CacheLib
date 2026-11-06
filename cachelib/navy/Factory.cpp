@@ -56,6 +56,10 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
 
   void setChecksum(bool enable) override { config_.checksum = enable; }
 
+  void setChecksumType(ChecksumType checksumType) override {
+    config_.checksumType = checksumType;
+  }
+
   void setLruEvictionPolicy() override {
     if (!(config_.cacheSize > 0 && config_.regionSize > 0)) {
       throw std::logic_error("layout is not set");
@@ -183,6 +187,10 @@ class BigHashProtoImpl final : public BigHashProto {
     bloomFilterEnabled_ = true;
     numHashes_ = numHashes;
     hashTableBitSize_ = hashTableBitSize;
+  }
+
+  void setChecksumType(ChecksumType checksumType) override {
+    config_.checksumType = checksumType;
   }
 
   void setNumMutexesPower(uint8_t numMutexesPower) override {

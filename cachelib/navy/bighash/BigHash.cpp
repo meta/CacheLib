@@ -78,6 +78,7 @@ BigHash::BigHash(Config&& config)
 
 BigHash::BigHash(Config&& config, ValidConfigTag)
     : numMutexes_(size_t{1} << config.numMutexesPower),
+      checksumType_(config.checksumType),
       checkExpired_(std::move(config.checkExpired)),
       destructorCb_{[cb = std::move(config.destructorCb)](
                         HashedKey hk, BufferView value, DestructorEvent event) {
@@ -255,7 +256,7 @@ uint64_t BigHash::estimatePersistSize() const {
 void BigHash::persist(RecordWriter& rw) {
   XLOG(INFO, "Starting bighash persist");
   serialization::BigHashPersistentData pd;
-  *pd.version() = kFormatVersion;
+  *pd.version() = formatVersion();
   *pd.generationTime() = generationTime_.count();
   *pd.itemCount() = itemCount_.get();
   *pd.bucketSize() = bucketSize_;
@@ -277,11 +278,11 @@ bool BigHash::recover(RecordReader& rr) {
   XLOG(INFO, "Starting bighash recovery");
   try {
     auto pd = deserializeProto<serialization::BigHashPersistentData>(rr);
-    if (*pd.version() != kFormatVersion) {
+    if (*pd.version() != formatVersion()) {
       throw std::logic_error{
           fmt::format("invalid format version {}, expected {}",
                       *pd.version(),
-                      kFormatVersion)};
+                      formatVersion())};
     }
 
     auto configEquals =
@@ -606,9 +607,9 @@ Buffer BigHash::readBucket(BucketId bid) {
 
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
 
-  auto checksumCheck = [](auto* b, auto bufferView) {
+  auto checksumCheck = [this](auto* b, auto bufferView) {
     const bool checksumSuccess =
-        Bucket::computeChecksum(bufferView) == b->getChecksum();
+        Bucket::computeChecksum(bufferView, checksumType_) == b->getChecksum();
     // TODO (T93631284) we only read a bucket if the bloom filter indicates that
     // the bucket could have the element. Hence, if check sum errors out and
     // bloom filter is enabled, we could record the checksum error. However,
@@ -634,7 +635,7 @@ Buffer BigHash::readBucket(BucketId bid) {
 
 bool BigHash::writeBucket(BucketId bid, Buffer buffer) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
-  bucket->setChecksum(Bucket::computeChecksum(buffer.view()));
+  bucket->setChecksum(Bucket::computeChecksum(buffer.view(), checksumType_));
   const bool res =
       device_.write(getBucketOffset(bid), std::move(buffer), placementHandle_);
   if (!res) {

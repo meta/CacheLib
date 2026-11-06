@@ -25,6 +25,7 @@
 #include "cachelib/cachebench/util/JSONConfig.h"
 #include "cachelib/cachebench/util/MemoryMonitorScript.h"
 #include "cachelib/common/Ticker.h"
+#include "cachelib/navy/common/ChecksumType.h"
 #include "cachelib/navy/common/Device.h"
 
 namespace facebook {
@@ -167,6 +168,9 @@ struct CacheConfig : public JSONConfig {
 
   // Navy specific: region size in MB
   uint64_t navyRegionSizeMB{16};
+
+  // Algorithm for persisted Navy checksums: "crc32" or "crc32c".
+  std::string navyChecksumType{"crc32"};
 
   // Independent Navy engine pairs sharing the NVM device. If empty, cachebench
   // configures one arena using navyBigHashSizePct for backward compatibility.
@@ -429,6 +433,7 @@ struct CacheConfig : public JSONConfig {
 
   std::shared_ptr<RebalanceStrategy> getRebalanceStrategy() const;
   std::vector<uint32_t> getNavyAllocatorCounts() const;
+  navy::ChecksumType getNavyChecksumType() const;
 
   bool memoryMonitorEnabled() const;
   MemoryMonitor::Config getMemoryMonitorConfig() const;

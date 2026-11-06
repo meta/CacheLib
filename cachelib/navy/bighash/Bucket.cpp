@@ -47,10 +47,10 @@ bool Bucket::Iterator::keyEqualsTo(HashedKey hk) const {
   return getIteratorEntry(itr_)->keyEqualsTo(hk);
 }
 
-uint32_t Bucket::computeChecksum(BufferView view) {
+uint32_t Bucket::computeChecksum(BufferView view, ChecksumType checksumType) {
   constexpr auto kChecksumStart = sizeof(checksum_);
   auto data = view.slice(kChecksumStart, view.size() - kChecksumStart);
-  return navy::checksum(data);
+  return navy::checksum(data, checksumType);
 }
 
 Bucket& Bucket::initNew(MutableBufferView view, uint64_t generationTime) {

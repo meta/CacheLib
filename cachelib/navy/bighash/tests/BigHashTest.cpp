@@ -21,6 +21,7 @@
 #include "cachelib/common/Hash.h"
 #include "cachelib/common/Utils.h"
 #include "cachelib/navy/bighash/BigHash.h"
+#include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/driver/Driver.h"
 #include "cachelib/navy/testing/BufferGen.h"
 #include "cachelib/navy/testing/Callbacks.h"
@@ -507,6 +508,67 @@ TEST(BigHash, Recovery) {
 
   EXPECT_EQ(Status::Ok, bh.lookup(makeHK("key"), value, lat));
   EXPECT_EQ(makeView("12345"), value.view());
+}
+
+TEST(BigHash, ChecksumFormatCompatibility) {
+  constexpr uint32_t kBucketSize = 4096;
+  for (auto writeType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+    for (auto recoverType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+      SCOPED_TRACE(testing::Message()
+                   << "write=" << static_cast<int>(writeType)
+                   << " recover=" << static_cast<int>(recoverType));
+      auto device = createMemoryDevice(kBucketSize, nullptr /* encryption */);
+      auto makeConfig = [&](ChecksumType checksumType) {
+        BigHash::Config config;
+        setLayout(config, kBucketSize, 1);
+        config.device = device.get();
+        if (checksumType == ChecksumType::Crc32c) {
+          config.checksumType = checksumType;
+        }
+        return config;
+      };
+
+      folly::IOBufQueue queue;
+      {
+        BigHash writer(makeConfig(writeType));
+        ASSERT_EQ(Status::Ok, writer.insert(makeHK("key"), makeView("value")));
+
+        auto bucketData = device->makeIOBuffer(kBucketSize);
+        ASSERT_TRUE(device->read(0, kBucketSize, bucketData.data()));
+        const auto& bucket =
+            *reinterpret_cast<const Bucket*>(bucketData.data());
+        const auto payload = bucketData.view().slice(
+            sizeof(uint32_t), kBucketSize - sizeof(uint32_t));
+        const auto expectedChecksum = checksum(payload, writeType);
+        EXPECT_EQ(expectedChecksum, bucket.getChecksum());
+
+        folly::IOBufQueue versionQueue;
+        auto versionWriter = createMemoryRecordWriter(versionQueue);
+        writer.persist(*versionWriter);
+        auto versionReader = createMemoryRecordReader(versionQueue);
+        auto metadata = deserializeProto<serialization::BigHashPersistentData>(
+            *versionReader);
+        EXPECT_EQ(writeType == ChecksumType::Crc32 ? 10 : 11,
+                  *metadata.version());
+
+        auto rw = createMemoryRecordWriter(queue);
+        writer.persist(*rw);
+      }
+
+      BigHash recovered(makeConfig(recoverType));
+      auto rr = createMemoryRecordReader(queue);
+      const bool sameFormat = writeType == recoverType;
+      ASSERT_EQ(sameFormat, recovered.recover(*rr));
+
+      Buffer value;
+      uint32_t lastAccessTime = 0;
+      EXPECT_EQ(sameFormat ? Status::Ok : Status::NotFound,
+                recovered.lookup(makeHK("key"), value, lastAccessTime));
+      if (sameFormat) {
+        EXPECT_EQ(makeView("value"), value.view());
+      }
+    }
+  }
 }
 
 TEST(BigHash, RecoveryBadConfig) {

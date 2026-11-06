@@ -129,6 +129,7 @@ void setTestNavyConfig(NavyConfig& config) {
 } // namespace
 TEST(NavyConfigTest, DefaultVal) {
   NavyConfig config{};
+  EXPECT_EQ(config.getChecksumType(), navy::ChecksumType::Crc32);
 
   const auto dynamicRandomConfig = config.dynamicRandomAdmPolicy();
   EXPECT_EQ(config.getAdmissionPolicy(), "");
@@ -175,6 +176,7 @@ TEST(NavyConfigTest, Serialization) {
   std::map<std::string, std::string> configMap = config.serialize();
 
   auto expectedConfigMap = std::map<std::string, std::string>();
+  expectedConfigMap["navyConfig::checksumType"] = "crc32";
   expectedConfigMap["navyConfig::admissionPolicy"] = "dynamic_random";
   expectedConfigMap["navyConfig::admissionProbability"] = "0";
   expectedConfigMap["navyConfig::admissionWriteRate"] = "100";
@@ -469,6 +471,13 @@ TEST(NavyConfigTest, JobScheduler) {
   EXPECT_EQ(config.getReaderThreads(), readerThreads);
   EXPECT_EQ(config.getWriterThreads(), writerThreads);
   EXPECT_EQ(config.getNavyReqOrderingShards(), navyReqOrderingShards);
+}
+
+TEST(NavyConfigTest, ChecksumType) {
+  NavyConfig config;
+  config.setChecksumType(navy::ChecksumType::Crc32c);
+  EXPECT_EQ(config.getChecksumType(), navy::ChecksumType::Crc32c);
+  EXPECT_EQ(config.serialize().at("navyConfig::checksumType"), "crc32c");
 }
 
 TEST(NavyConfigTest, OtherSettings) {

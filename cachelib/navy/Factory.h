@@ -50,6 +50,9 @@ class BlockCacheProto {
   // Enable data checksumming (default: disabled)
   virtual void setChecksum(bool enable) = 0;
 
+  // Select the persisted checksum format (default: CRC32).
+  virtual void setChecksumType(ChecksumType checksumType) = 0;
+
   // set*EvictionPolicy function family: sets eviction policy. Supports LRU,
   // LRU with deferred insert and FIFO. Must set up one of them.
 
@@ -118,6 +121,9 @@ class BlockCacheProto {
 class BigHashProto {
  public:
   virtual ~BigHashProto() = default;
+
+  // Select the persisted checksum format (default: CRC32).
+  virtual void setChecksumType(ChecksumType checksumType) = 0;
 
   // Set cache layout. Cache will start at @baseOffset and will be @size bytes
   // on the device. BigHash divides its device spcae into a number of fixed size

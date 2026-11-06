@@ -106,6 +106,7 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
                       uint64_t bigHashReservedSize,
                       uint64_t bigHashEndOffset,
                       uint64_t bigHashStartOffsetLimit,
+                      navy::ChecksumType checksumType,
                       cachelib::navy::EnginePairProto& proto) {
   auto bucketSize = bigHashConfig.getBucketSize();
   if (bucketSize != alignUp(bucketSize, ioAlignSize)) {
@@ -121,6 +122,7 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
 
   auto bigHash = cachelib::navy::createBigHashProto();
   bigHash->setLayout(bigHashCacheOffset, bigHashCacheSize, bucketSize);
+  bigHash->setChecksumType(checksumType);
 
   // Bucket Bloom filter size, bytes
   //
@@ -170,6 +172,7 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
                          bool usesRaidFiles,
                          bool itemDestructorEnabled,
                          uint32_t stackSize,
+                         navy::ChecksumType checksumType,
                          cachelib::navy::EnginePairProto& proto) {
   auto regionSize = blockCacheConfig.getRegionSize();
   if (regionSize != alignUp(regionSize, ioAlignSize)) {
@@ -196,6 +199,7 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   auto blockCache = cachelib::navy::createBlockCacheProto();
   blockCache->setLayout(blockCacheOffset, blockCacheSize, regionSize);
   blockCache->setChecksum(blockCacheConfig.getDataChecksum());
+  blockCache->setChecksumType(checksumType);
 
   // set eviction policy
   auto segmentRatio = blockCacheConfig.getSFifoSegmentRatio();
@@ -296,7 +300,7 @@ void setupCacheProtos(const navy::NavyConfig& config,
           totalCacheSize * enginesConfig.bigHash().getSizePct() / 100ul;
       bigHashStartOffset = setupBigHash(
           enginesConfig.bigHash(), ioAlignSize, bigHashSize, bigHashEndOffset,
-          blockCacheStartOffset, *enginePairProto);
+          blockCacheStartOffset, config.getChecksumType(), *enginePairProto);
       blockCacheSize = blockCacheSize == 0
                            ? bigHashStartOffset - blockCacheStartOffset
                            : blockCacheSize;
@@ -314,7 +318,7 @@ void setupCacheProtos(const navy::NavyConfig& config,
       blockCacheEndOffset = setupBlockCache(
           enginesConfig.blockCache(), blockCacheSize, ioAlignSize,
           blockCacheStartOffset, config.usesRaidFiles(), itemDestructorEnabled,
-          config.getStackSize(), *enginePairProto);
+          config.getStackSize(), config.getChecksumType(), *enginePairProto);
     }
     if (blockCacheEndOffset > bigHashStartOffset) {
       throw std::invalid_argument(

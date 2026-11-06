@@ -68,7 +68,8 @@ class FOLLY_PACK_ATTR Bucket {
   };
 
   // User will pass in a view that contains the memory that is a Bucket
-  static uint32_t computeChecksum(BufferView view);
+  static uint32_t computeChecksum(
+      BufferView view, ChecksumType checksumType = ChecksumType::Crc32);
 
   // Initialize a brand new Bucket given a piece of memory in the case
   // that the existing bucket is invalid. (I.e. checksum or generation

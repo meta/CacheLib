@@ -84,6 +84,37 @@ TEST(StressorConfigTest, RejectsDramIteratorWorkWithoutSleep) {
                std::invalid_argument);
 }
 
+TEST(CacheConfigTest, NavyChecksumDefaultsToCrc32) {
+  const CacheConfig defaultConfig;
+  const CacheConfig jsonConfig{folly::dynamic::object()};
+
+  EXPECT_EQ("crc32", defaultConfig.navyChecksumType);
+  EXPECT_EQ(navy::ChecksumType::Crc32, defaultConfig.getNavyChecksumType());
+  EXPECT_EQ("crc32", jsonConfig.navyChecksumType);
+  EXPECT_EQ(navy::ChecksumType::Crc32, jsonConfig.getNavyChecksumType());
+}
+
+TEST(CacheConfigTest, ParsesNavyChecksumType) {
+  const CacheConfig legacyConfig{
+      folly::dynamic::object("navyChecksumType", "crc32")};
+  const CacheConfig crc32cConfig{
+      folly::dynamic::object("navyChecksumType", "crc32c")};
+
+  EXPECT_EQ("crc32", legacyConfig.navyChecksumType);
+  EXPECT_EQ(navy::ChecksumType::Crc32, legacyConfig.getNavyChecksumType());
+  EXPECT_EQ("crc32c", crc32cConfig.navyChecksumType);
+  EXPECT_EQ(navy::ChecksumType::Crc32c, crc32cConfig.getNavyChecksumType());
+}
+
+TEST(CacheConfigTest, RejectsInvalidNavyChecksumType) {
+  for (const auto* checksumType : {"", "CRC32C", "auto"}) {
+    SCOPED_TRACE(checksumType);
+    EXPECT_THROW(
+        CacheConfig{folly::dynamic::object("navyChecksumType", checksumType)},
+        std::invalid_argument);
+  }
+}
+
 TEST(CacheConfigTest, NavyArenasDefaultToLegacySingleArena) {
   const CacheConfig config{folly::dynamic::object()};
 

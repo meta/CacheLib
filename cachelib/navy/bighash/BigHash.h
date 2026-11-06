@@ -65,6 +65,7 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
  public:
   struct Config {
     uint32_t bucketSize{4 * 1024};
+    ChecksumType checksumType{ChecksumType::Crc32};
 
     // The range of device that BigHash will access is guaranteed to be
     // within [baseOffset, baseOffset + cacheSize)
@@ -222,8 +223,16 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
   // Number of mutexes for bucket locking
   const size_t numMutexes_;
 
-  // Serialization format version. Never 0. Versions < 10 reserved for testing.
-  static constexpr uint32_t kFormatVersion = 10;
+  // Serialization format versions. Never 0. Versions < 10 reserved for testing.
+  static constexpr uint32_t kCrc32FormatVersion = 10;
+  static constexpr uint32_t kCrc32cFormatVersion = 11;
+
+  int32_t formatVersion() const {
+    return checksumType_ == ChecksumType::Crc32c ? kCrc32cFormatVersion
+                                                 : kCrc32FormatVersion;
+  }
+
+  const ChecksumType checksumType_;
 
   const ExpiredCheck checkExpired_{};
   const DestructorCallback destructorCb_{};

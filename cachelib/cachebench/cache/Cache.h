@@ -945,6 +945,7 @@ Cache<Allocator>::Cache(const CacheConfig& config,
           [numArenas](HashedKey key) { return key.keyHash() % numArenas; });
     }
 
+    nvmConfig.navyConfig.setChecksumType(config_.getNavyChecksumType());
     nvmConfig.navyConfig.setMaxParcelMemoryMB(config_.navyParcelMemoryMB);
 
     nvmConfig.navyConfig.setReaderAndWriterThreads(config_.navyReaderThreads,

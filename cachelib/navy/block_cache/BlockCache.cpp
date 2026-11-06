@@ -225,6 +225,7 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
       checkExpired_{std::move(config.checkExpired)},
       destructorCb_{std::move(config.destructorCb)},
       checksumData_{config.checksum},
+      checksumType_{config.checksumType},
       device_{*config.device},
       allocAlignSize_{calcAllocAlignSize()},
       readBufferSize_{config.readBufferSize < kDefReadBufferSize
@@ -536,14 +537,14 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     auto entryEnd = buffer.data() + offset;
     auto desc =
         *reinterpret_cast<const EntryDesc*>(entryEnd - sizeof(EntryDesc));
-    if (desc.csSelf != desc.computeChecksum()) {
+    if (desc.csSelf != desc.computeChecksum(checksumType_)) {
       XLOGF(ERR,
             "Item header checksum mismatch in getRandomAlloc(). Region {} is "
             "likely corrupted. Expected: {}, Actual: {}, Offset-end: {}, "
             "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum(),
+            desc.computeChecksum(checksumType_),
             addrEnd.offset(),
             regionManager_.physicalOffset(addrEnd),
             sizeof(EntryDesc),
@@ -561,14 +562,14 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     }
 
     BufferView valueView{desc.valueSize, entryEnd - entrySize};
-    if (checksumData_ && desc.cs != checksum(valueView)) {
+    if (checksumData_ && desc.cs != checksum(valueView, checksumType_)) {
       XLOGF(ERR,
             "Item value checksum mismatch in getRandomAlloc(). Region {} is "
             "likely corrupted. Expected: {}, Actual: {}, Offset: {}, "
             "Physical-offset: {}, Value-size: {}, Payload (hex): {}",
             rid.index(),
             desc.cs,
-            checksum(valueView),
+            checksum(valueView, checksumType_),
             addrEnd.offset() - entrySize,
             regionManager_.physicalOffset(addrEnd) - entrySize,
             desc.valueSize,
@@ -683,7 +684,7 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
     auto entryEnd = buffer.data() + offset;
     auto desc =
         *reinterpret_cast<const EntryDesc*>(entryEnd - sizeof(EntryDesc));
-    if (desc.csSelf != desc.computeChecksum()) {
+    if (desc.csSelf != desc.computeChecksum(checksumType_)) {
       reclaimEntryHeaderChecksumErrorCount_.inc();
       XLOGF(ERR,
             "Item header checksum mismatch in onRegionReclaim(). Item {} is "
@@ -695,7 +696,7 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
             " Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum(),
+            desc.computeChecksum(checksumType_),
             addrEnd.offset(),
             regionManager_.physicalOffset(addrEnd),
             sizeof(EntryDesc),
@@ -753,7 +754,7 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     auto entryEnd = buffer.data() + offset;
     auto desc =
         *reinterpret_cast<const EntryDesc*>(entryEnd - sizeof(EntryDesc));
-    if (desc.csSelf != desc.computeChecksum()) {
+    if (desc.csSelf != desc.computeChecksum(checksumType_)) {
       cleanupEntryHeaderChecksumErrorCount_.inc();
       XLOGF(ERR,
             "Item header checksum mismatch in onRegionCleanup(). Region {} is "
@@ -761,7 +762,7 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
             "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum(),
+            desc.computeChecksum(checksumType_),
             offset,
             regionManager_.physicalOffset(RelAddress{rid, offset}),
             sizeof(EntryDesc),
@@ -774,7 +775,7 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     HashedKey hk =
         makeHK(entryEnd - sizeof(EntryDesc) - desc.keySize, desc.keySize);
     BufferView value{desc.valueSize, entryEnd - entrySize};
-    if (checksumData_ && desc.cs != checksum(value)) {
+    if (checksumData_ && desc.cs != checksum(value, checksumType_)) {
       // We do not need to abort here since the EntryDesc checksum was good, so
       // we can safely proceed to read the next entry.
       cleanupValueChecksumErrorCount_.inc();
@@ -865,15 +866,15 @@ std::optional<uint64_t> BlockCache::onKeyHashRetrievalFromLocation(
     }
   }
 
-  if (entryDesc.csSelf != entryDesc.computeChecksum()) {
+  if (entryDesc.csSelf != entryDesc.computeChecksum(checksumType_)) {
     XLOGF(ERR,
           "Item header checksum mismatch in onKeyHashRetrievalFromLocation(). "
           "Region {} is "
           "likely corrupted. Expected: {}, Actual: {}, Offset-end: {}, "
           "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
-          addrEnd.rid().index(), entryDesc.csSelf, entryDesc.computeChecksum(),
-          addrEnd.offset(), regionManager_.physicalOffset(addrEnd),
-          sizeof(EntryDesc),
+          addrEnd.rid().index(), entryDesc.csSelf,
+          entryDesc.computeChecksum(checksumType_), addrEnd.offset(),
+          regionManager_.physicalOffset(addrEnd), sizeof(EntryDesc),
           folly::hexlify(
               folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
     return std::nullopt;
@@ -991,15 +992,15 @@ Status BlockCache::onReadCombinedEntryBlock(uint32_t address,
   auto entryEnd = buffer.data() + buffer.size();
   auto entryDesc = *reinterpret_cast<EntryDesc*>(entryEnd - sizeof(EntryDesc));
   // Check header checksum
-  if (entryDesc.csSelf != entryDesc.computeChecksum()) {
+  if (entryDesc.csSelf != entryDesc.computeChecksum(checksumType_)) {
     XLOGF(ERR,
           "Item header checksum mismatch in onReadCombinedEntryBlock(). "
           "Region {} is "
           "likely corrupted. Expected: {}, Actual: {}, Offset-end: {}, "
           "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
-          addrEnd.rid().index(), entryDesc.csSelf, entryDesc.computeChecksum(),
-          addrEnd.offset(), regionManager_.physicalOffset(addrEnd),
-          sizeof(EntryDesc),
+          addrEnd.rid().index(), entryDesc.csSelf,
+          entryDesc.computeChecksum(checksumType_), addrEnd.offset(),
+          regionManager_.physicalOffset(addrEnd), sizeof(EntryDesc),
           folly::hexlify(
               folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
     return Status::ChecksumError;
@@ -1026,19 +1027,21 @@ Status BlockCache::onReadCombinedEntryBlock(uint32_t address,
   }
 
   // Check the checksum for the value
-  if (checksumData_ && entryDesc.cs != checksum(BufferView(entryDesc.valueSize,
-                                                           buffer.data()))) {
-    XLOGF(ERR,
-          "Item value checksum mismatch in onReadCombinedEntryBlock(). "
-          "Region {} is likely corrupted. Expected: {}, Actual: {}, Offset: "
-          "{}, Physical-offset: {}, "
-          "Value-size: {} Payload (hex): {}",
-          addrEnd.rid().index(), entryDesc.cs,
-          checksum(BufferView(entryDesc.valueSize, buffer.data())),
-          addrEnd.offset() - size,
-          regionManager_.physicalOffset(addrEnd) - size, entryDesc.valueSize,
-          folly::hexlify(folly::ByteRange(
-              buffer.data(), buffer.data() + entryDesc.valueSize)));
+  if (checksumData_ &&
+      entryDesc.cs != checksum(BufferView(entryDesc.valueSize, buffer.data()),
+                               checksumType_)) {
+    XLOGF(
+        ERR,
+        "Item value checksum mismatch in onReadCombinedEntryBlock(). "
+        "Region {} is likely corrupted. Expected: {}, Actual: {}, Offset: "
+        "{}, Physical-offset: {}, "
+        "Value-size: {} Payload (hex): {}",
+        addrEnd.rid().index(), entryDesc.cs,
+        checksum(BufferView(entryDesc.valueSize, buffer.data()), checksumType_),
+        addrEnd.offset() - size, regionManager_.physicalOffset(addrEnd) - size,
+        entryDesc.valueSize,
+        folly::hexlify(folly::ByteRange(buffer.data(),
+                                        buffer.data() + entryDesc.valueSize)));
     return Status::ChecksumError;
   }
 
@@ -1191,7 +1194,7 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
   }
 
   // Validate checksum as we want to reinsert the item
-  if (checksumData_ && entryDesc.cs != checksum(value)) {
+  if (checksumData_ && entryDesc.cs != checksum(value, checksumType_)) {
     // We do not need to abort here since the EntryDesc checksum was good, so
     // we can safely proceed to read the next entry.
     XLOGF(ERR,
@@ -1200,7 +1203,7 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
           "We will continue evaluating remaining items in the region."
           "Expected: {}, Actual: {}, Value-size: {}, Payload (hex): {}",
           entryDesc.cs,
-          checksum(value),
+          checksum(value, checksumType_),
           entryDesc.valueSize,
           folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
     reclaimValueChecksumErrorCount_.inc();
@@ -1312,13 +1315,14 @@ folly::Expected<BlockCache::AllocData, Status> BlockCache::allocateForInsert(
     MutableBufferView buffer,
     const HashedKey& hk,
     uint32_t valueSize,
-    uint32_t lastAccessTimeSecs) {
+    uint32_t lastAccessTimeSecs,
+    ChecksumType checksumType) {
   // Copy descriptor and the key to the end
   const auto& key = hk.key();
   uint8_t* dest = buffer.data() + buffer.size() - sizeof(EntryDesc);
   auto desc = new (dest)
       EntryDesc(static_cast<uint32_t>(key.size()), valueSize, hk.keyHash(),
-                lastAccessTimeSecs);                      // desc
+                lastAccessTimeSecs, checksumType);        // desc
   std::memcpy(dest - key.size(), key.data(), key.size()); // key
   return desc;
 }
@@ -1342,11 +1346,11 @@ void BlockCache::writeEntry(MutableBufferView buffer,
   uint8_t* dest = buffer.data() + buffer.size() - sizeof(EntryDesc);
   auto desc = new (dest) EntryDesc(static_cast<uint32_t>(keySize),
                                    static_cast<uint32_t>(value.size()), keyHash,
-                                   lastAccessTimeSecs);
+                                   lastAccessTimeSecs, checksumType_);
 
   if (checksumData_) {
     desc->cs = precomputedChecksum.has_value() ? *precomputedChecksum
-                                               : checksum(value);
+                                               : checksum(value, checksumType_);
   }
 
   if (!combinedEntry) {
@@ -1395,13 +1399,13 @@ void BlockCache::readEntry(RegionDescriptor& regionDesc,
 
   auto entryEnd = buffer.data() + buffer.size();
   auto desc = *reinterpret_cast<EntryDesc*>(entryEnd - sizeof(EntryDesc));
-  if (desc.csSelf != desc.computeChecksum()) {
+  if (desc.csSelf != desc.computeChecksum(checksumType_)) {
     lookupEntryHeaderChecksumErrorCount_.inc();
     XLOG_N_PER_MS(ERR, 10, 10'000) << fmt::format(
         "Header checksum mismatch in readEntry() at Region: {}, Expected: {}, "
         "Actual: {}, Offset-end: {}, Physical-offset-end: {}, Header size: {}, "
         "Header (hex): {}",
-        addrEnd.rid().index(), desc.csSelf, desc.computeChecksum(),
+        addrEnd.rid().index(), desc.csSelf, desc.computeChecksum(checksumType_),
         addrEnd.offset(), regionManager_.physicalOffset(addrEnd),
         sizeof(EntryDesc),
         folly::hexlify(
@@ -1440,12 +1444,12 @@ void BlockCache::readEntry(RegionDescriptor& regionDesc,
   ld.valueSize_ = desc.valueSize;
   ld.lastAccessTimeSecs_ = desc.lastAccessTimeSecs;
   auto slice = ld.buffer_.view().slice(0, desc.valueSize);
-  if (checksumData_ && desc.cs != checksum(slice)) {
+  if (checksumData_ && desc.cs != checksum(slice, checksumType_)) {
     XLOG_N_PER_MS(ERR, 10, 10'000) << fmt::format(
         "Item value checksum mismatch in readEntry() looking up key {} in "
         "Region {}. Expected: {}, Actual: {}, Offset: {}, Physical-offset: {}, "
         "Value-size: {} Payload (hex): {}",
-        key, addrEnd.rid().index(), desc.cs, checksum(slice),
+        key, addrEnd.rid().index(), desc.cs, checksum(slice, checksumType_),
         addrEnd.offset() - size, regionManager_.physicalOffset(addrEnd) - size,
         slice.size(),
         folly::hexlify(
@@ -1649,7 +1653,9 @@ serialization::BlockCacheConfig BlockCache::serializeConfig(
   *serializedConfig.cacheBaseOffset() = config.cacheBaseOffset;
   *serializedConfig.cacheSize() = config.cacheSize;
   *serializedConfig.checksum() = config.checksum;
-  *serializedConfig.version() = kFormatVersion;
+  *serializedConfig.version() = config.checksumType == ChecksumType::Crc32
+                                    ? kFormatVersion
+                                    : kCrc32cFormatVersion;
   return serializedConfig;
 }
 

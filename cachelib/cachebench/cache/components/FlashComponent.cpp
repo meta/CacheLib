@@ -138,6 +138,7 @@ std::unique_ptr<CacheComponent> createFlashCacheComponent(
   // BlockCacheConfig::setCleanRegions() in NavyConfig.cpp
   bcConfig.numInMemBuffers = 2 * config.navyCleanRegions;
   bcConfig.checksum = config.navyDataChecksum;
+  bcConfig.checksumType = config.getNavyChecksumType();
   bcConfig.indexConfig.setNumSparseMapBuckets(config.navyNumSparseMapBuckets)
       .setNumBucketsPerMutex(config.navyNumBucketsPerMutex);
   if (config.navyEnableItemHistoryTracking) {

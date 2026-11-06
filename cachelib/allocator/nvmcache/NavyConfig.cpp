@@ -342,6 +342,8 @@ std::map<std::string, std::string> EnginesConfig::serialize() const {
 
 std::map<std::string, std::string> NavyConfig::serialize() const {
   auto configMap = std::map<std::string, std::string>();
+  configMap["navyConfig::checksumType"] =
+      checksumType_ == ChecksumType::Crc32 ? "crc32" : "crc32c";
 
   // admission policy settings
   configMap["navyConfig::admissionPolicy"] = getAdmissionPolicy();

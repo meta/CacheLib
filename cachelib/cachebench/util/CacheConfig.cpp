@@ -66,6 +66,7 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
 
   JSONSetVal(configJson, navyBlockSize);
   JSONSetVal(configJson, navyRegionSizeMB);
+  JSONSetVal(configJson, navyChecksumType);
   if (const auto* arenas = configJson.get_ptr("navyArenas")) {
     if (!arenas->isArray()) {
       folly::throw_exception<folly::TypeError>("array", arenas->type());
@@ -195,13 +196,18 @@ CacheConfig::CacheConfig(const folly::dynamic& configJson) {
   // if you added new fields to the configuration, update the JSONSetVal
   // to make them available for the json configs and increment the size
   // below
-  checkCorrectSize<CacheConfig, 1128>();
+  checkCorrectSize<CacheConfig, 1160>();
 
   if (numPools != poolSizes.size()) {
     throw std::invalid_argument(fmt::format(
         "number of pools must be the same as the pool size distribution. "
         "numPools: {}, poolSizes.size(): {}",
         numPools, poolSizes.size()));
+  }
+  if (navyChecksumType != "crc32" && navyChecksumType != "crc32c") {
+    throw std::invalid_argument(fmt::format(
+        "Invalid navyChecksumType '{}': expected 'crc32' or 'crc32c'",
+        navyChecksumType));
   }
   if (memoryMonitorMode != "disabled" && memoryMonitorMode != "resident" &&
       memoryMonitorMode != "free") {
@@ -300,6 +306,18 @@ std::vector<uint32_t> CacheConfig::getNavyAllocatorCounts() const {
   const auto numPriorities =
       std::max<size_t>(1, navySegmentedFifoSegmentRatio.size());
   return std::vector<uint32_t>(numPriorities, navyAllocatorsPerPriority);
+}
+
+navy::ChecksumType CacheConfig::getNavyChecksumType() const {
+  if (navyChecksumType == "crc32") {
+    return navy::ChecksumType::Crc32;
+  }
+  if (navyChecksumType == "crc32c") {
+    return navy::ChecksumType::Crc32c;
+  }
+  throw std::invalid_argument(
+      fmt::format("Invalid navyChecksumType '{}': expected 'crc32' or 'crc32c'",
+                  navyChecksumType));
 }
 
 bool CacheConfig::memoryMonitorEnabled() const {

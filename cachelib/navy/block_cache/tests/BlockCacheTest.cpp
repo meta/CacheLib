@@ -19,6 +19,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include "cachelib/navy/common/Buffer.h"
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/driver/Driver.h"
+#include "cachelib/navy/serialization/Serialization.h"
 #include "cachelib/navy/testing/BufferGen.h"
 #include "cachelib/navy/testing/Callbacks.h"
 #include "cachelib/navy/testing/MockDevice.h"
@@ -1634,6 +1636,91 @@ TEST(BlockCache, Recovery) {
     uint32_t lat = 0;
     EXPECT_EQ(Status::Ok, driver->lookup(log[i].key(), value, lat));
     EXPECT_EQ(log[i].value(), value.view());
+  }
+}
+
+TEST(BlockCache, ChecksumTypePersistence) {
+  for (auto writtenType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+    for (auto recoveredType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+      SCOPED_TRACE(testing::Message()
+                   << "written=" << static_cast<int>(writtenType)
+                   << ", recovered=" << static_cast<int>(recoveredType));
+      auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+      auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);
+      EXPECT_EQ(ChecksumType::Crc32, config.checksumType);
+      config.checksum = true;
+      if (writtenType == ChecksumType::Crc32c) {
+        config.checksumType = writtenType;
+      }
+      auto engine = makeEngine(std::move(config));
+      auto* blockCache = static_cast<BlockCache*>(engine.get());
+      auto driver = makeDriver(std::move(engine), makeJobScheduler());
+      CacheEntry entry{strzBuffer("checksum-key"),
+                       strzBuffer("checksum-value")};
+      ASSERT_EQ(Status::Ok, driver->insert(entry.key(), entry.value()));
+      driver->flush();
+
+      // Inspect the persisted entry through the index lookup API. In the
+      // existing 32-byte wire format, csSelf follows 20 bytes of metadata.
+      // Check the actual bytes so switching both readers and writers to the
+      // wrong algorithm cannot make a round-trip-only test pass.
+      auto it = blockCache->index().begin();
+      ASSERT_NE(it, blockCache->index().end());
+      auto result = blockCache->lookup(*it);
+      ASSERT_TRUE(result.hasValue());
+      EXPECT_EQ(entry.value(), result->value());
+      auto buffer = result->releaseBuffer();
+      constexpr size_t kHeaderChecksumOffset = 20;
+      auto header = buffer.view().slice(buffer.size() - kSizeOfEntryDesc,
+                                        kHeaderChecksumOffset);
+      uint32_t storedHeaderChecksum;
+      std::memcpy(&storedHeaderChecksum, header.data() + header.size(),
+                  sizeof(storedHeaderChecksum));
+      EXPECT_EQ(checksum(header, writtenType), storedHeaderChecksum);
+      auto otherType = writtenType == ChecksumType::Crc32 ? ChecksumType::Crc32c
+                                                          : ChecksumType::Crc32;
+      EXPECT_NE(checksum(header, otherType), storedHeaderChecksum);
+      uint32_t storedValueChecksum;
+      std::memcpy(&storedValueChecksum,
+                  header.data() + header.size() + sizeof(uint32_t),
+                  sizeof(storedValueChecksum));
+      EXPECT_EQ(checksum(entry.value(), writtenType), storedValueChecksum);
+
+      folly::IOBufQueue metadata;
+      auto metadataWriter = createMemoryRecordWriter(metadata);
+      blockCache->persist(*metadataWriter);
+      auto metadataReader = createMemoryRecordReader(metadata);
+      auto persisted =
+          deserializeProto<serialization::BlockCacheConfig>(*metadataReader);
+      EXPECT_EQ(writtenType == ChecksumType::Crc32 ? 13 : 14,
+                *persisted.version());
+
+      folly::IOBufQueue recoveryData;
+      auto writer = createMemoryRecordWriter(recoveryData);
+      blockCache->persist(*writer);
+      driver.reset();
+
+      auto recoveredConfig =
+          makeConfig(std::make_unique<FifoPolicy>(), *device);
+      recoveredConfig.checksum = true;
+      recoveredConfig.checksumType = recoveredType;
+      auto recoveredEngine = makeEngine(std::move(recoveredConfig));
+      auto reader = createMemoryRecordReader(recoveryData);
+      EXPECT_EQ(writtenType == recoveredType,
+                recoveredEngine->recover(*reader));
+      auto recoveredDriver =
+          makeDriver(std::move(recoveredEngine), makeJobScheduler());
+      Buffer value;
+      uint32_t lastAccessTimeSecs = 0;
+      auto status =
+          recoveredDriver->lookup(entry.key(), value, lastAccessTimeSecs);
+      if (writtenType == recoveredType) {
+        ASSERT_EQ(Status::Ok, status);
+        EXPECT_EQ(entry.value(), value.view());
+      } else {
+        EXPECT_EQ(Status::NotFound, status);
+      }
+    }
   }
 }
 

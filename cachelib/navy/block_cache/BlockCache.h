@@ -32,6 +32,7 @@
 #include "cachelib/navy/block_cache/Index.h"
 #include "cachelib/navy/block_cache/RegionManager.h"
 #include "cachelib/navy/common/Device.h"
+#include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/engine/Engine.h"
 
 namespace facebook {
@@ -56,6 +57,9 @@ class BlockCache final : public Engine {
     DestructorCallback destructorCb;
     // Checksum data read/written
     bool checksum{};
+    // CRC-32 preserves existing persisted caches. Selecting CRC-32C changes
+    // the persisted format and requires a cold cache when changing modes.
+    ChecksumType checksumType{ChecksumType::Crc32};
     // Base offset and size (in bytes) of cache on the device
     uint64_t cacheBaseOffset{};
     uint64_t cacheSize{};
@@ -288,14 +292,17 @@ class BlockCache final : public Engine {
       static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
 
  private:
-  // Serialization format version. Never 0. Versions < 10 reserved for testing.
+  // Serialization format versions. Never 0; versions < 10 are for testing.
+  // Version 13 uses CRC-32 (IEEE); version 14 uses CRC-32C (Castagnoli).
+  // Recovery requires the version matching the configured checksum type.
   static constexpr uint32_t kFormatVersion = 13;
+  static constexpr uint32_t kCrc32cFormatVersion = 14;
   // This should be at least the nextTwoPow(sizeof(EntryDesc)).
   static constexpr uint32_t kDefReadBufferSize = 4096;
   // Default priority for an item inserted into block cache
   static constexpr uint16_t kDefaultItemPriority = 0;
 
-  // When modify @EntryDesc layout, don't forget to bump @kFormatVersion!
+  // When modifying EntryDesc layout, bump both serialization format versions.
   struct EntryDesc {
     uint32_t keySize{};
     uint32_t valueSize{};
@@ -305,17 +312,23 @@ class BlockCache final : public Engine {
     uint32_t cs{};
 
     EntryDesc() = default;
-    EntryDesc(uint32_t ks, uint32_t vs, uint64_t kh, uint32_t accessTime = 0)
+    EntryDesc(uint32_t ks,
+              uint32_t vs,
+              uint64_t kh,
+              uint32_t accessTime = 0,
+              ChecksumType checksumType = ChecksumType::Crc32)
         : keySize{ks},
           valueSize{vs},
           keyHash{kh},
           lastAccessTimeSecs{accessTime} {
-      csSelf = computeChecksum();
+      csSelf = computeChecksum(checksumType);
     }
 
-    uint32_t computeChecksum() const {
+    uint32_t computeChecksum(
+        ChecksumType checksumType = ChecksumType::Crc32) const {
       return checksum(BufferView{offsetof(EntryDesc, csSelf),
-                                 reinterpret_cast<const uint8_t*>(this)});
+                                 reinterpret_cast<const uint8_t*>(this)},
+                      checksumType);
     }
   };
 
@@ -363,10 +376,12 @@ class BlockCache final : public Engine {
   // @param buffer      buffer to write into
   // @param hk          key to be inserted
   // @param valueSize   size of the value to be inserted
-  static EntryDesc* writeEntryDescAndKey(MutableBufferView buffer,
-                                         const HashedKey& hk,
-                                         uint32_t valueSize,
-                                         uint32_t lastAccessTimeSecs = 0);
+  static EntryDesc* writeEntryDescAndKey(
+      MutableBufferView buffer,
+      const HashedKey& hk,
+      uint32_t valueSize,
+      uint32_t lastAccessTimeSecs = 0,
+      ChecksumType checksumType = ChecksumType::Crc32);
 
   struct LookupData {
     Buffer buffer_;
@@ -540,6 +555,7 @@ class BlockCache final : public Engine {
   const ExpiredCheck checkExpired_;
   const DestructorCallback destructorCb_;
   const bool checksumData_{};
+  const ChecksumType checksumType_;
   // reference to the under-lying device.
   const Device& device_;
   // alloc alignment size indicates the granularity of entry sizes on device.

@@ -53,12 +53,14 @@ class FlashCacheItem : public CacheItem {
                  uint32_t valueSize,
                  FlashCacheComponent::AllocData&& allocation,
                  const uint32_t creationTime,
-                 const uint32_t ttlSecs)
+                 const uint32_t ttlSecs,
+                 ChecksumType checksumType)
       : FlashCacheItem(std::move(allocation)) {
     XDCHECK_GE(valueSize, 2 * sizeof(uint32_t))
         << "valueSize doesn't include space for metadata";
     auto view = getMutableBufferView();
-    BlockCache::writeEntryDescAndKey(view, hashedKey, valueSize);
+    BlockCache::writeEntryDescAndKey(view, hashedKey, valueSize,
+                                     0 /* lastAccessTimeSecs */, checksumType);
     uint32_t* metadata = reinterpret_cast<uint32_t*>(view.data());
     metadata[0] = creationTime;
     metadata[1] = ttlSecs > 0 ? creationTime + ttlSecs : 0;
@@ -386,8 +388,9 @@ folly::coro::Task<Result<AllocatedHandle>> FlashCacheComponent::allocateGeneric(
   // NOTE: we can't checksum until the user has finished writing their data,
   // defer until they call insert()
   AllocatedHandle handle(*this, InlineItem);
-  new (getInlineBuf(handle)) CacheItemT(
-      hashedKey, valueSize, std::move(result).value(), creationTime, ttlSecs);
+  new (getInlineBuf(handle))
+      CacheItemT(hashedKey, valueSize, std::move(result).value(), creationTime,
+                 ttlSecs, cache_->checksumType_);
   co_return std::move(handle);
 }
 
@@ -660,7 +663,8 @@ bool FlashCacheComponent::writeBackImpl(CacheItem& item, bool allowReplace) {
   // is synchronous - only allocation is async
 
   if (cache_->checksumData_) {
-    desc->cs = checksum(fccItem.getBufferView().slice(0, desc->valueSize));
+    desc->cs = checksum(fccItem.getBufferView().slice(0, desc->valueSize),
+                        cache_->checksumType_);
   }
   cache_->logicalWrittenCount_.add(logicalSizeWritten);
   return cache_->updateIndex(keyHash, totalSize, fccItem.getRelAddress(),
@@ -742,12 +746,14 @@ class ConsistentFlashCacheItem : public FlashCacheItem {
                            uint32_t valueSize,
                            FlashCacheComponent::AllocData&& allocation,
                            const uint32_t creationTime,
-                           const uint32_t ttlSecs)
+                           const uint32_t ttlSecs,
+                           ChecksumType checksumType)
       : FlashCacheItem(hashedKey,
                        valueSize,
                        std::move(allocation),
                        creationTime,
-                       ttlSecs) {}
+                       ttlSecs,
+                       checksumType) {}
   ConsistentFlashCacheItem(FlashCacheComponent::AllocData&& allocation,
                            const Buffer& existingData)
       : FlashCacheItem(std::move(allocation), existingData) {}

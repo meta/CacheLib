@@ -26,6 +26,7 @@
 #include "cachelib/allocator/nvmcache/BlockCacheReinsertionPolicy.h"
 #include "cachelib/common/EventInterface.h"
 #include "cachelib/common/Hash.h"
+#include "cachelib/navy/common/ChecksumType.h"
 
 namespace facebook {
 namespace cachelib {
@@ -999,6 +1000,13 @@ class NavyConfig {
                      bool useIoUring,
                      uint32_t stackSizeKB = 0);
 
+  // Changing the checksum type requires a cold start of persisted caches.
+  void setChecksumType(ChecksumType checksumType) {
+    checksumType_ = checksumType;
+  }
+
+  ChecksumType getChecksumType() const { return checksumType_; }
+
   // ============ BlockCache settings =============
   // Return BlockCacheConfig for configuration.
   BlockCacheConfig& blockCache() noexcept {
@@ -1118,6 +1126,7 @@ class NavyConfig {
   uint32_t qDepth_{0};
 
   // ============ Engines settings =============
+  ChecksumType checksumType_{ChecksumType::Crc32};
   std::vector<EnginesConfig> enginesConfigs_{1};
   // Function to map each item to a pair of engine.
   EnginesSelector selector_{};
