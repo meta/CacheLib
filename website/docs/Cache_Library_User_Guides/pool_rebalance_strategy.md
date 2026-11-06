@@ -131,7 +131,10 @@ This specifies the minimum amount of memory in slabs that specific object size c
 * `numSlabsFreeMem`
   If an allocation class has more than this many slabs worth of free memory
   (i.e. `numSlabsFreeMem * Slab::kSize` bytes) and has not recently evicted,
-  it is prioritized as a victim.
+  it is prioritized as a victim. If it holds no live items (e.g. it was
+  emptied by TTL expiry or removals), it gives up a slab without the
+  `tailAgeDifferenceRatio` and `minTailAgeDifference` checks, since its tail
+  age of 0 would always fail them.
 
 * `slabProjectionLength`
   How many slabs worth of items to project when computing the victim's

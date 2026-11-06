@@ -131,6 +131,69 @@ TEST(RebalanceStrategy, FreeMemIgnoresEvictingVictims) {
   EXPECT_EQ(Slab::kInvalidClassId, context.receiverClassId);
 }
 
+// Verify that LruTailAge gives a slab from a class emptied by removals to an
+// evicting class, even though the emptied class has a tail age of 0.
+TEST(RebalanceStrategy, LruTailAgeReleasesFromEmptiedClass) {
+  constexpr size_t kCacheSlabs = 10;
+  constexpr size_t kSlabsPerClass = kCacheSlabs / 2;
+  constexpr uint32_t kSmallAllocSize = Slab::kSize / 2;
+  constexpr uint32_t kLargeAllocSize = Slab::kSize;
+  constexpr uint32_t kSmallItemSize = Slab::kSize / 3;
+  constexpr uint32_t kLargeItemSize = Slab::kSize * 2 / 3;
+
+  LruAllocator::Config config;
+  config.setCacheSize((kCacheSlabs + 1) * Slab::kSize);
+  auto cache = std::make_unique<LruAllocator>(config);
+  const auto pid = cache->addPool("default",
+                                  cache->getCacheMemoryStats().ramCacheSize,
+                                  {kSmallAllocSize, kLargeAllocSize});
+  ASSERT_NE(Slab::kInvalidPoolId, pid);
+
+  const ClassId smallClass{0};
+  const ClassId largeClass{1};
+  std::vector<std::string> smallKeys;
+
+  for (uint32_t i = 0;
+       cache->getPoolStats(pid).numSlabsForClass(largeClass) < kSlabsPerClass;
+       ++i) {
+    ASSERT_NE(nullptr,
+              util::allocateAccessible(*cache, pid, fmt::format("large-{}", i),
+                                       kLargeItemSize));
+  }
+
+  for (uint32_t i = 0;
+       cache->getPoolStats(pid).numSlabsForClass(smallClass) < kSlabsPerClass;
+       ++i) {
+    auto key = fmt::format("small-{}", i);
+    ASSERT_NE(nullptr,
+              util::allocateAccessible(*cache, pid, key, kSmallItemSize));
+    smallKeys.push_back(std::move(key));
+  }
+
+  LruTailAgeStrategy strategy;
+  // The first call only records the baseline stats.
+  strategy.pickVictimAndReceiver(*cache, pid);
+
+  const auto initialLargeEvictions =
+      cache->getPoolStats(pid).cacheStats.at(largeClass).numEvictions();
+  for (uint32_t i = 0;
+       cache->getPoolStats(pid).cacheStats.at(largeClass).numEvictions() ==
+       initialLargeEvictions;
+       ++i) {
+    ASSERT_NE(nullptr, util::allocateAccessible(
+                           *cache, pid, fmt::format("large-evict-{}", i),
+                           kLargeItemSize));
+  }
+
+  for (const auto& key : smallKeys) {
+    cache->remove(key);
+  }
+
+  const auto context = strategy.pickVictimAndReceiver(*cache, pid);
+  EXPECT_EQ(smallClass, context.victimClassId);
+  EXPECT_EQ(largeClass, context.receiverClassId);
+}
+
 namespace tests {
 template <typename AllocatorT>
 class RebalanceStrategyTest : public testing::Test {

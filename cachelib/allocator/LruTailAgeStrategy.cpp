@@ -157,7 +157,10 @@ RebalanceContext LruTailAgeStrategy::pickVictimAndReceiverImpl(
     return kNoOpContext;
   }
 
-  if (!config.getWeight) {
+  // A victim with no live items loses nothing by giving up a slab, and its
+  // tail age of 0 would always fail this check.
+  if (!config.getWeight &&
+      poolStats.mpStats.acStats.at(ctx.victimClassId).activeAllocs > 0) {
     const auto victimProjectedTailAge =
         getProjectedAge(poolEvictionAgeStats, ctx.victimClassId);
     const auto receiverTailAge =

@@ -26,7 +26,7 @@ namespace cachelib {
 // is released from the victim only if the difference between the victim's
 // projected tail age and the receiver's tail age exceeds both the minimum tail
 // age difference and the tail age difference ratio of the victim's projected
-// tail age.
+// tail age. A victim with no live items is released without this check.
 class LruTailAgeStrategy : public RebalanceStrategy {
  public:
   struct Config : public BaseConfig {
