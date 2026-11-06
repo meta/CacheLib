@@ -23,6 +23,7 @@
 #include <folly/json/DynamicConverter.h>
 #include <folly/json/json.h>
 
+#include <bit>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -429,6 +430,12 @@ class CacheAllocatorConfig {
   // Set numShards to use for CacheAllocator locks
   CacheAllocatorConfig& setNumShards(size_t shards);
 
+  // Split the MM container of every (pool, allocation class) into this many
+  // independently locked shards. Must be a power of two no larger than
+  // kMaxMMContainerShards. Only supported for MMLru. The shard count is
+  // persisted, so changing it forces a cold start on the next attach.
+  CacheAllocatorConfig& setMMContainerShards(uint32_t shards);
+
   // skip promote children items in chained when parent fail to promote
   bool isSkipPromoteChildrenWhenParentFailed() const noexcept {
     return skipPromoteChildrenWhenParentFailed;
@@ -813,6 +820,11 @@ class CacheAllocatorConfig {
   bool delayCacheWorkersStart{false};
 
   size_t numShards{8192};
+
+  // Number of MM container shards per (pool, allocation class).
+  // See setMMContainerShards().
+  static constexpr uint32_t kMaxMMContainerShards{64};
+  uint32_t mmContainerShards{1};
 
   // If true, aggregate pool stats into a single stat before exporting
   bool aggregatePoolStats{false};
@@ -1394,6 +1406,13 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setNumShards(size_t shards) {
 }
 
 template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setMMContainerShards(
+    uint32_t shards) {
+  mmContainerShards = shards;
+  return *this;
+}
+
+template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setSlabAsanPoisoning(
     [[maybe_unused]] bool enable) {
 #if FOLLY_SANITIZE_ADDRESS
@@ -1424,6 +1443,19 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
         "config cache size: {}  exceeds max addressable space for cache: {}",
         size,
         maxCacheSize));
+  }
+
+  if (!std::has_single_bit(mmContainerShards) ||
+      mmContainerShards > kMaxMMContainerShards) {
+    throw std::invalid_argument(fmt::format(
+        "mmContainerShards must be a power of two in [1, {}], got {}",
+        kMaxMMContainerShards,
+        mmContainerShards));
+  }
+  if (mmContainerShards > 1 && T::MMType::kId != MMLru::kId) {
+    throw std::invalid_argument(
+        fmt::format("mmContainerShards > 1 is only supported for MMLru, not {}",
+                    getEvictionPolicyName()));
   }
 
   // we don't allow user to enable both RemoveCB and ItemDestructor
@@ -1596,6 +1628,7 @@ std::map<std::string, std::string> CacheAllocatorConfig<T>::serialize() const {
   configMap["delayCacheWorkersStart"] =
       delayCacheWorkersStart ? "true" : "false";
   configMap["numShards"] = std::to_string(numShards);
+  configMap["mmContainerShards"] = std::to_string(mmContainerShards);
   configMap["aggregatePoolStats"] = aggregatePoolStats ? "true" : "false";
   mergeWithPrefix(configMap, throttleConfig.serialize(), "throttleConfig");
   mergeWithPrefix(configMap,

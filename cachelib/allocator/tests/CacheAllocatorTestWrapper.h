@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "cachelib/allocator/CacheAllocator.h"
 
 namespace facebook::cachelib::tests {
@@ -56,6 +58,16 @@ class CacheAllocatorTestWrapper {
   static typename Allocator::WriteHandle createHandle(
       Allocator* alloc, typename Allocator::Item& item) {
     return alloc->acquire(&item);
+  }
+
+  template <class Allocator>
+  static std::vector<size_t> getMMContainerShardSizes(const Allocator& alloc,
+                                                      PoolId pid,
+                                                      ClassId cid) {
+    std::vector<size_t> sizes;
+    alloc.forEachMMContainerShard(
+        pid, cid, [&sizes](const auto& mm) { sizes.push_back(mm.size()); });
+    return sizes;
   }
 };
 

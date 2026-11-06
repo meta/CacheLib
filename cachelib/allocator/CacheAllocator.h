@@ -27,7 +27,9 @@
 #include <folly/synchronization/SanitizeThread.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -1615,7 +1617,30 @@ class CacheAllocator : public CacheBase {
       std::array<std::array<MMContainerPtr, MemoryAllocator::kMaxClasses>,
                  MemoryPoolManager::kMaxPools>;
 
+  // Shards 1..N-1 of one (pool, class) MM container when
+  // config_.mmContainerShards > 1. Shard 0 is mmContainers_[pid][cid].
+  struct MMContainerShardSet {
+    std::vector<MMContainerPtr> extraShards;
+    // Racy hint of each shard's tail update time: where its last eviction
+    // scan stopped. Used to pick the shard to evict from without locking.
+    std::unique_ptr<std::atomic<uint32_t>[]> tailTimes;
+  };
+  using MMContainerShardSets =
+      std::array<std::array<MMContainerShardSet, MemoryAllocator::kMaxClasses>,
+                 MemoryPoolManager::kMaxPools>;
+
+  // A sharded cache stores its shard count above these bits of the persisted
+  // MM type id, so binaries that predate sharding refuse to attach instead of
+  // restoring shard 0 only.
+  static constexpr unsigned int kMMTypeIdShardShift{16};
+
   void createMMContainers(const PoolId pid, MMConfig config);
+
+  void initMMContainerShardSet(PoolId pid, ClassId cid);
+
+  bool isMMContainerSharded() const noexcept {
+    return config_.mmContainerShards > 1;
+  }
 
   // acquire the MMContainer corresponding to the the Item's class and pool.
   //
@@ -1624,7 +1649,40 @@ class CacheAllocator : public CacheBase {
   // allocation from the memory allocator.
   MMContainer& getMMContainer(const Item& item) const noexcept;
 
+  // same as above for an item already known to be in (pid, cid)
+  MMContainer& getMMContainer(PoolId pid,
+                              ClassId cid,
+                              const Item& item) const noexcept;
+
+  // For a sharded cache this is shard 0 only. Use forEachMMContainerShard()
+  // for per-class operations.
   MMContainer& getMMContainer(PoolId pid, ClassId cid) const noexcept;
+
+  MMContainer& getMMContainerShard(PoolId pid,
+                                   ClassId cid,
+                                   uint32_t shard) const noexcept;
+
+  // Shard of the item within its (pool, class). Only valid when sharded.
+  uint32_t getMMShardIndex(const Item& item) const noexcept;
+
+  // Calls fn(MMContainer&) for every shard of (pid, cid) in shard order.
+  template <typename Fn>
+  void forEachMMContainerShard(PoolId pid, ClassId cid, Fn&& fn) const;
+
+  // Picks the shard to evict from: of two random shards, the one whose tail
+  // hint is older. Only valid when sharded.
+  uint32_t pickEvictionShard(PoolId pid, ClassId cid) const noexcept;
+
+  static void updateTailTimeHint(std::atomic<uint32_t>& hint,
+                                 uint32_t time) noexcept {
+    // skip redundant stores to keep the hint's cache line shared
+    if (hint.load(std::memory_order_relaxed) != time) {
+      hint.store(time, std::memory_order_relaxed);
+    }
+  }
+
+  // MM container stats summed over shards; the oldest tail wins.
+  MMContainerStat getMMContainerStat(PoolId pid, ClassId cid) const noexcept;
 
   // Fragmentation bytes for a class; a read racing alloc/free on other
   // threads can transiently underflow the thread-local sum, so clamp to 0.
@@ -1632,6 +1690,10 @@ class CacheAllocator : public CacheBase {
     const uint64_t v = (*stats_.fragmentationSize)[pid][cid].get();
     return static_cast<int64_t>(v) < 0 ? 0 : v;
   }
+
+  // Eviction age stats merged over shards.
+  EvictionAgeStat getMMContainerEvictionAgeStat(
+      PoolId pid, ClassId cid, uint64_t projectedLength) const noexcept;
 
   // create a new cache allocation. The allocation can be initialized
   // appropriately and made accessible through insert or insertOrReplace.
@@ -2040,6 +2102,9 @@ class CacheAllocator : public CacheBase {
   MMContainers deserializeMMContainers(
       Deserializer& deserializer,
       const typename Item::PtrCompressor& compressor);
+
+  // Throws if any restored (pool, class) is missing some of its shards.
+  void validateMMContainerShards(const MMContainers& mmContainers) const;
 
   unsigned int reclaimSlabs(PoolId id, size_t numSlabs) final {
     return allocator_->reclaimSlabsAndGrow(id, numSlabs);
@@ -2658,6 +2723,11 @@ class CacheAllocator : public CacheBase {
   // Lock to synchronize addition of a new pool and its resizing/rebalancing
   mutable folly::SharedMutex poolsResizeAndRebalanceLock_;
 
+  // Extra MM container shards, null unless config_.mmContainerShards > 1, so
+  // an unsharded cache keeps its layout and lookup path. Declared before
+  // mmContainers_ because deserializeMMContainers() fills it in.
+  std::unique_ptr<MMContainerShardSets> mmContainerShards_;
+
   // container for the allocations which are currently being memory managed by
   // the cache allocator.
   // we need mmcontainer per allocator pool/allocation class.
@@ -2885,6 +2955,9 @@ CacheAllocator<CacheTrait>::CacheAllocator(
                                ? std::make_unique<CCacheManager>(*allocator_)
                                : restoreCCacheManager()),
       compressor_(createPtrCompressor()),
+      mmContainerShards_(config_.mmContainerShards > 1
+                             ? std::make_unique<MMContainerShardSets>()
+                             : nullptr),
       mmContainers_(type == InitMemType::kMemAttach
                         ? deserializeMMContainers(*deserializer_, compressor_)
                         : MMContainers{}),
@@ -4236,20 +4309,33 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
   typename NvmCacheT::PutToken token;
   Item* toRecycle = nullptr;
   Item* candidate = nullptr;
-  auto& mmContainer = getMMContainer(pid, cid);
+  unsigned int searchLimit = config_.evictionSearchTries;
+  std::atomic<uint32_t>* tailTime = nullptr;
+  uint32_t shard = 0;
+  if (isMMContainerSharded()) {
+    shard = pickEvictionShard(pid, cid);
+    tailTime = &(*mmContainerShards_)[pid][cid].tailTimes[shard];
+    // Scan at most half of the remaining budget in one shard, so a shard
+    // whose tail is pinned leaves tries for the others.
+    if (searchLimit != 0) {
+      searchLimit = searchTries + std::max(1u, (searchLimit - searchTries) / 2);
+    }
+  }
+  auto& mmContainer = getMMContainerShard(pid, cid, shard);
 
   mmContainer.withEvictionIterator([this, pid, cid, &candidate, &toRecycle,
-                                    &searchTries, &mmContainer,
-                                    &token](auto&& itr) {
+                                    &searchTries, &mmContainer, &token,
+                                    searchLimit, tailTime](auto&& itr) {
     if (!itr) {
       ++searchTries;
       (*stats_.evictionAttempts)[pid][cid].inc();
+      if (tailTime) {
+        updateTailTimeHint(*tailTime, util::getCurrentTimeSec());
+      }
       return;
     }
 
-    while ((config_.evictionSearchTries == 0 ||
-            config_.evictionSearchTries > searchTries) &&
-           itr) {
+    while ((searchLimit == 0 || searchLimit > searchTries) && itr) {
       ++searchTries;
       (*stats_.evictionAttempts)[pid][cid].inc();
 
@@ -4329,6 +4415,9 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
       toRecycle = toRecycle_;
       candidate = candidate_;
       token = std::move(putToken);
+      if (tailTime) {
+        updateTailTimeHint(*tailTime, toRecycle_->getLastAccessTime());
+      }
 
       // Check if parent changed for chained items - if yes, we cannot
       // remove the child from the mmContainer as we will not be evicting
@@ -4339,6 +4428,11 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
         mmContainer.remove(itr);
       }
       return;
+    }
+
+    if (tailTime) {
+      updateTailTimeHint(*tailTime, itr ? itr->getLastAccessTime()
+                                        : util::getCurrentTimeSec());
     }
   });
 
@@ -4677,7 +4771,18 @@ typename CacheAllocator<CacheTrait>::MMContainer&
 CacheAllocator<CacheTrait>::getMMContainer(const Item& item) const noexcept {
   const auto allocInfo =
       allocator_->getAllocInfo(static_cast<const void*>(&item));
-  return getMMContainer(allocInfo.poolId, allocInfo.classId);
+  return getMMContainer(allocInfo.poolId, allocInfo.classId, item);
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::MMContainer&
+CacheAllocator<CacheTrait>::getMMContainer(PoolId pid,
+                                           ClassId cid,
+                                           const Item& item) const noexcept {
+  if (FOLLY_LIKELY(!isMMContainerSharded())) {
+    return getMMContainer(pid, cid);
+  }
+  return getMMContainerShard(pid, cid, getMMShardIndex(item));
 }
 
 template <typename CacheTrait>
@@ -4687,6 +4792,122 @@ CacheAllocator<CacheTrait>::getMMContainer(PoolId pid,
   XDCHECK_LT(static_cast<size_t>(pid), mmContainers_.size());
   XDCHECK_LT(static_cast<size_t>(cid), mmContainers_[pid].size());
   return *mmContainers_[pid][cid];
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::MMContainer&
+CacheAllocator<CacheTrait>::getMMContainerShard(PoolId pid,
+                                                ClassId cid,
+                                                uint32_t shard) const noexcept {
+  if (shard == 0) {
+    return getMMContainer(pid, cid);
+  }
+  XDCHECK_LT(shard, config_.mmContainerShards);
+  return *(*mmContainerShards_)[pid][cid].extraShards[shard - 1];
+}
+
+template <typename CacheTrait>
+uint32_t CacheAllocator<CacheTrait>::getMMShardIndex(
+    const Item& item) const noexcept {
+  XDCHECK(isMMContainerSharded());
+  // Fibonacci hash of the item's offset from the start of slab memory. Unlike
+  // the key (chained items are rekeyed when their parent moves), the offset is
+  // fixed while the memory is allocated, is safe to compute for an item that is
+  // concurrently being freed, and survives a warm roll remapping the slabs.
+  constexpr uint64_t kFibonacciMultiplier = 0x9E3779B97F4A7C15ULL;
+  const uint64_t offset =
+      reinterpret_cast<uintptr_t>(&item) -
+      reinterpret_cast<uintptr_t>(allocator_->getSlabMemoryInfo().first);
+  return static_cast<uint32_t>(
+      (offset * kFibonacciMultiplier) >>
+      (64 - std::countr_zero(config_.mmContainerShards)));
+}
+
+template <typename CacheTrait>
+template <typename Fn>
+void CacheAllocator<CacheTrait>::forEachMMContainerShard(PoolId pid,
+                                                         ClassId cid,
+                                                         Fn&& fn) const {
+  fn(getMMContainer(pid, cid));
+  if (isMMContainerSharded()) {
+    for (const auto& shard : (*mmContainerShards_)[pid][cid].extraShards) {
+      fn(*shard);
+    }
+  }
+}
+
+template <typename CacheTrait>
+uint32_t CacheAllocator<CacheTrait>::pickEvictionShard(
+    PoolId pid, ClassId cid) const noexcept {
+  // xorshift64, per thread so concurrent evictors spread over the shards
+  thread_local uint64_t rng = folly::Random::rand64() | 1;
+  rng ^= rng << 13;
+  rng ^= rng >> 7;
+  rng ^= rng << 17;
+
+  const uint32_t mask = config_.mmContainerShards - 1;
+  const auto first = static_cast<uint32_t>(rng) & mask;
+  // uniform over the other N-1 shards
+  const auto offset = static_cast<uint32_t>(((rng >> 32) * mask) >> 32);
+  const auto second = (first + 1 + offset) & mask;
+
+  const auto& tailTimes = (*mmContainerShards_)[pid][cid].tailTimes;
+  return tailTimes[second].load(std::memory_order_relaxed) <
+                 tailTimes[first].load(std::memory_order_relaxed)
+             ? second
+             : first;
+}
+
+template <typename CacheTrait>
+MMContainerStat CacheAllocator<CacheTrait>::getMMContainerStat(
+    PoolId pid, ClassId cid) const noexcept {
+  if (!isMMContainerSharded()) {
+    return getMMContainer(pid, cid).getStats();
+  }
+  MMContainerStat total{};
+  forEachMMContainerShard(pid, cid, [&total](const MMContainer& mm) {
+    const auto stat = mm.getStats();
+    total.size += stat.size;
+    // an empty shard reports 0
+    if (stat.oldestTimeSec != 0 && (total.oldestTimeSec == 0 ||
+                                    stat.oldestTimeSec < total.oldestTimeSec)) {
+      total.oldestTimeSec = stat.oldestTimeSec;
+    }
+    total.lruRefreshTime = std::max(total.lruRefreshTime, stat.lruRefreshTime);
+    total.numHotAccesses += stat.numHotAccesses;
+    total.numColdAccesses += stat.numColdAccesses;
+    total.numWarmAccesses += stat.numWarmAccesses;
+    total.numTailAccesses += stat.numTailAccesses;
+  });
+  return total;
+}
+
+template <typename CacheTrait>
+EvictionAgeStat CacheAllocator<CacheTrait>::getMMContainerEvictionAgeStat(
+    PoolId pid, ClassId cid, uint64_t projectedLength) const noexcept {
+  if (!isMMContainerSharded()) {
+    return getMMContainer(pid, cid).getEvictionAgeStat(projectedLength);
+  }
+  // Items spread evenly over the shards, so removing projectedLength items
+  // from the merged tail removes about projectedLength / N from each shard,
+  // and the oldest remaining item is the oldest of the shards' projected tails.
+  const uint32_t numShards = config_.mmContainerShards;
+  EvictionAgeStat total{};
+  auto merge = [](EvictionStatPerType& acc, const EvictionStatPerType& stat) {
+    acc.oldestElementAge =
+        std::max(acc.oldestElementAge, stat.oldestElementAge);
+    acc.size += stat.size;
+    acc.projectedAge = std::max(acc.projectedAge, stat.projectedAge);
+  };
+  forEachMMContainerShard(
+      pid, cid,
+      [&total, &merge, projectedLength, numShards](const MMContainer& mm) {
+        const auto stat = mm.getEvictionAgeStat(projectedLength / numShards);
+        merge(total.warmQueueStat, stat.warmQueueStat);
+        merge(total.hotQueueStat, stat.hotQueueStat);
+        merge(total.coldQueueStat, stat.coldQueueStat);
+      });
+  return total;
 }
 
 template <typename CacheTrait>
@@ -4881,7 +5102,7 @@ bool CacheAllocator<CacheTrait>::recordAccessInMMContainer(Item& item,
     ring_->trackItem(reinterpret_cast<uintptr_t>(&item), item.getSize());
   }
 
-  auto& mmContainer = getMMContainer(allocInfo.poolId, allocInfo.classId);
+  auto& mmContainer = getMMContainer(allocInfo.poolId, allocInfo.classId, item);
   return mmContainer.recordAccess(item, mode);
 }
 
@@ -4963,14 +5184,15 @@ std::vector<std::string> CacheAllocator<CacheTrait>::dumpEvictionIterator(
 
   std::vector<std::string> content;
 
-  auto& mm = *mmContainers_[pid][cid];
-  auto evictItr = mm.getEvictionIterator();
-  size_t i = 0;
-  while (evictItr && i < numItems) {
-    content.push_back(evictItr->toString());
-    ++evictItr;
-    ++i;
-  }
+  // a sharded container is dumped one shard after another, not in global LRU
+  // order
+  forEachMMContainerShard(pid, cid, [&content, numItems](MMContainer& mm) {
+    auto evictItr = mm.getEvictionIterator();
+    while (evictItr && content.size() < numItems) {
+      content.push_back(evictItr->toString());
+      ++evictItr;
+    }
+  });
 
   return content;
 }
@@ -5264,7 +5486,9 @@ void CacheAllocator<CacheTrait>::overridePoolConfig(PoolId pid,
                   .getAllocsPerSlab()
             : 0);
     DCHECK_NOTNULL(mmContainers_[pid][cid].get());
-    mmContainers_[pid][cid]->setConfig(mmConfig);
+    forEachMMContainerShard(
+        pid, static_cast<ClassId>(cid),
+        [&mmConfig](MMContainer& mm) { mm.setConfig(mmConfig); });
   }
 }
 
@@ -5279,7 +5503,22 @@ void CacheAllocator<CacheTrait>::createMMContainers(const PoolId pid,
                   .getAllocsPerSlab()
             : 0);
     mmContainers_[pid][cid].reset(new MMContainer(config, compressor_));
+    if (isMMContainerSharded()) {
+      initMMContainerShardSet(pid, static_cast<ClassId>(cid));
+      for (auto& shard : (*mmContainerShards_)[pid][cid].extraShards) {
+        shard.reset(new MMContainer(config, compressor_));
+      }
+    }
   }
+}
+
+template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::initMMContainerShardSet(PoolId pid,
+                                                         ClassId cid) {
+  auto& shardSet = (*mmContainerShards_)[pid][cid];
+  shardSet.extraShards.resize(config_.mmContainerShards - 1);
+  shardSet.tailTimes =
+      std::make_unique<std::atomic<uint32_t>[]>(config_.mmContainerShards);
 }
 
 template <typename CacheTrait>
@@ -5428,7 +5667,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
             fragmentationSizeStat(poolId, cid), classHits,
             (*stats_.chainedItemEvictions)[poolId][cid].get(),
             (*stats_.regularItemEvictions)[poolId][cid].get(),
-            mmContainers_[poolId][cid]->getStats()}
+            getMMContainerStat(poolId, cid)}
 
           });
       totalHits += classHits;
@@ -5459,12 +5698,11 @@ PoolEvictionAgeStats CacheAllocator<CacheTrait>::getPoolEvictionAgeStats(
   const auto& pool = allocator_->getPool(pid);
   const auto& allocSizes = pool.getAllocSizes();
   for (ClassId cid = 0; static_cast<size_t>(cid) < allocSizes.size(); ++cid) {
-    auto& mmContainer = getMMContainer(pid, cid);
     const auto numItemsPerSlab =
         allocator_->getPool(pid).getAllocationClass(cid).getAllocsPerSlab();
     const auto projectionLength = numItemsPerSlab * slabProjectionLength;
     stats.classEvictionAgeStats[cid] =
-        mmContainer.getEvictionAgeStat(projectionLength);
+        getMMContainerEvictionAgeStat(pid, cid, projectionLength);
   }
 
   return stats;
@@ -5741,8 +5979,12 @@ CacheAllocator<CacheTrait>::allocateNewItemForOldItem(const Item& oldItem) {
   }
 
   XDCHECK_EQ(newItemHdl->getSize(), oldItem.getSize());
-  XDCHECK_EQ(reinterpret_cast<uintptr_t>(&getMMContainer(oldItem)),
-             reinterpret_cast<uintptr_t>(&getMMContainer(*newItemHdl)));
+  // same (pool, class) MM container; a sharded one may differ in shard
+  XDCHECK_EQ(reinterpret_cast<uintptr_t>(
+                 &getMMContainer(allocInfo.poolId, allocInfo.classId)),
+             reinterpret_cast<uintptr_t>(&getMMContainer(
+                 allocator_->getAllocInfo(newItemHdl->getMemory()).poolId,
+                 allocator_->getAllocInfo(newItemHdl->getMemory()).classId)));
 
   return newItemHdl;
 }
@@ -6025,7 +6267,10 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
   *metadata_.allocatorVersion() = kCachelibVersion;
   *metadata_.ramFormatVersion() = kCacheRamFormatVersion;
   *metadata_.cacheCreationTime() = static_cast<int64_t>(cacheCreationTime_);
-  *metadata_.mmType() = MMType::kId;
+  *metadata_.mmType() = isMMContainerSharded()
+                            ? MMType::kId | (int64_t{config_.mmContainerShards}
+                                             << kMMTypeIdShardShift)
+                            : MMType::kId;
   *metadata_.accessType() = AccessType::kId;
   if (config_.slabHugePageSize.isHugePage()) {
     *metadata_.slabPageSize() =
@@ -6061,6 +6306,16 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
     for (unsigned int j = 0; j < mmContainers_[i].size(); ++j) {
       if (mmContainers_[i][j]) {
         mmContainersState.pools_ref()[i][j] = mmContainers_[i][j]->saveState();
+        if (!isMMContainerSharded()) {
+          continue;
+        }
+        // shard s of class j is keyed j + s * kMaxClasses
+        const auto& extraShards = (*mmContainerShards_)[i][j].extraShards;
+        for (unsigned int s = 1; s <= extraShards.size(); ++s) {
+          mmContainersState
+              .pools_ref()[i][j + s * MemoryAllocator::kMaxClasses] =
+              extraShards[s - 1]->saveState();
+        }
       }
     }
   }
@@ -6196,6 +6451,26 @@ void CacheAllocator<CacheTrait>::saveRamCache() {
 }
 
 template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::validateMMContainerShards(
+    const MMContainers& mmContainers) const {
+  for (unsigned int i = 0; i < mmContainers.size(); ++i) {
+    for (unsigned int j = 0; j < mmContainers[i].size(); ++j) {
+      const auto& shardSet = (*mmContainerShards_)[i][j];
+      const bool complete =
+          shardSet.tailTimes != nullptr && mmContainers[i][j] != nullptr &&
+          std::all_of(shardSet.extraShards.begin(),
+                      shardSet.extraShards.end(),
+                      [](const auto& shard) { return shard != nullptr; });
+      if (!complete && (shardSet.tailTimes || mmContainers[i][j])) {
+        throw std::invalid_argument(fmt::format(
+            "Persisted MM container shards of pool {} class {} are incomplete",
+            i, j));
+      }
+    }
+  }
+}
+
+template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::MMContainers
 CacheAllocator<CacheTrait>::deserializeMMContainers(
     Deserializer& deserializer,
@@ -6209,7 +6484,17 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
     auto i = static_cast<PoolId>(kvPool.first);
     auto& pool = getPool(i);
     for (auto& kv : kvPool.second) {
-      auto j = static_cast<ClassId>(kv.first);
+      // see saveStateToIOBuf() for how shards are keyed
+      const auto shard =
+          static_cast<uint32_t>(kv.first) / MemoryAllocator::kMaxClasses;
+      auto j = static_cast<ClassId>(static_cast<uint32_t>(kv.first) %
+                                    MemoryAllocator::kMaxClasses);
+      if (shard >= config_.mmContainerShards) {
+        throw std::invalid_argument(fmt::format(
+            "Persisted MM container shard {} of pool {} class {} exceeds the "
+            "configured {} shards",
+            shard, i, j, config_.mmContainerShards));
+      }
       MMContainerPtr ptr =
           std::make_unique<typename MMContainerPtr::element_type>(kv.second,
                                                                   compressor);
@@ -6218,8 +6503,18 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
                                 ? pool.getAllocationClass(j).getAllocsPerSlab()
                                 : 0);
       ptr->setConfig(config);
-      mmContainers[i][j] = std::move(ptr);
+      if (shard == 0) {
+        mmContainers[i][j] = std::move(ptr);
+        continue;
+      }
+      if (!(*mmContainerShards_)[i][j].tailTimes) {
+        initMMContainerShardSet(i, j);
+      }
+      (*mmContainerShards_)[i][j].extraShards[shard - 1] = std::move(ptr);
     }
+  }
+  if (isMMContainerSharded()) {
+    validateMMContainerShards(mmContainers);
   }
   // We need to drop the unevictableMMContainer in the desierializer.
   // TODO: remove this at version 17.
@@ -6247,9 +6542,20 @@ CacheAllocator<CacheTrait>::deserializeCacheAllocatorMetadata(
                     AccessType::kId));
   }
 
-  if (*meta.mmType() != MMType::kId) {
+  const auto persistedMMType =
+      *meta.mmType() & ((int64_t{1} << kMMTypeIdShardShift) - 1);
+  if (persistedMMType != MMType::kId) {
     throw std::invalid_argument(fmt::format("Expected {}, got {} for MMType",
                                             *meta.mmType(), MMType::kId));
+  }
+
+  const auto persistedShards =
+      std::max<int64_t>(1, *meta.mmType() >> kMMTypeIdShardShift);
+  if (persistedShards != config_.mmContainerShards) {
+    throw std::invalid_argument(fmt::format(
+        "MM container shards changed across restarts: persisted {}, "
+        "configured {}",
+        persistedShards, config_.mmContainerShards));
   }
 
   const size_t persistedSlabPageSize =
