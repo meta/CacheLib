@@ -87,7 +87,7 @@
     "axios": "^1.14.0",
     "wait-on": "^7.2.0",
     "**/express/path-to-regexp": "0.1.13",
-    "node-forge": "^1.4.0",
+    "node-forge": "^1.4.3",
     "flatted": "^3.4.2",
     "svgo": "^2.8.4",
     "picomatch": "^2.3.2",
