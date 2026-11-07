@@ -4785,7 +4785,7 @@ typename CacheAllocator<CacheTrait>::MMContainer&
 CacheAllocator<CacheTrait>::getMMContainer(PoolId pid,
                                            ClassId cid,
                                            const Item& item) const noexcept {
-  if (FOLLY_LIKELY(!isMMContainerSharded())) {
+  if (!isMMContainerSharded()) [[likely]] {
     return getMMContainer(pid, cid);
   }
   return getMMContainerShard(pid, cid, getMMShardIndex(item));

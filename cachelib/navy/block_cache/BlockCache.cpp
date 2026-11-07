@@ -411,7 +411,7 @@ BlockCache::LookupData BlockCache::lookupInternal(const KeyT& key,
   case OpenStatus::Ready: {
     SCOPE_EXIT { regionManager_.close(std::move(desc)); };
     readEntry(desc, ld, addrEnd, decodeSizeHint(lr.sizeHint()), expected);
-    if (FOLLY_UNLIKELY(ld.status_ == Status::DeviceError)) {
+    if (ld.status_ == Status::DeviceError) [[unlikely]] {
       // Remove this item from index so no future lookup will ever attempt to
       // read it. If the address still matches and the item is removed, reclaim
       // will also not be able to re-insert it as it does not exist in index. If
