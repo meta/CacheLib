@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 #include <folly/CPortability.h>
+#include <folly/Range.h>
 #include <folly/String.h>
 
 #include <atomic>
@@ -766,10 +767,11 @@ std::string CacheItem<CacheTrait>::toString() const {
         "isNvmLargeItem={}:hasChainedItem="
         "{}",
         fmt::ptr(this), getRefCountAndFlagsRaw(), getSize(),
-        folly::humanify(getKey().str()), folly::hexlify(getKey()),
-        isInMMContainer(), isAccessible(), isMarkedForEviction(), isMoving(),
-        getRefCount(), getCreationTime(), getExpiryTime(), getLastAccessTime(),
-        isNvmClean(), isNvmEvicted(), isNvmLargeItem(), hasChainedItem());
+        folly::humanify(getKey().str()),
+        folly::hexlify(folly::ByteRange{getKey()}), isInMMContainer(),
+        isAccessible(), isMarkedForEviction(), isMoving(), getRefCount(),
+        getCreationTime(), getExpiryTime(), getLastAccessTime(), isNvmClean(),
+        isNvmEvicted(), isNvmLargeItem(), hasChainedItem());
   }
 }
 
