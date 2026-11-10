@@ -29,6 +29,10 @@ TYPED_TEST(SimplePoolOptimizationTest, PoolOptimizerBasic) {
   this->testPoolOptimizerBasic();
 }
 
+TYPED_TEST(SimplePoolOptimizationTest, StopWorkersStopsPoolOptimizer) {
+  this->testStopWorkersStopsPoolOptimizer();
+}
+
 } // namespace tests
 } // namespace cachelib
 } // namespace facebook
