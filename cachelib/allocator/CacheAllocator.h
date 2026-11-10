@@ -1499,7 +1499,8 @@ class CacheAllocator : public CacheBase {
   // and the cache was actually attached.
   static bool cleanupStrayShmSegments(const std::string& cacheDir,
                                       bool posix,
-                                      const std::string& hugePageMountDir = "");
+                                      const std::string& hugePageMountDir = "",
+                                      const std::string& posixShmDir = "");
 
   // gives a relative offset to a pointer within the cache.
   uint64_t getItemPtrAsOffset(const void* ptr);
@@ -2949,7 +2950,8 @@ CacheAllocator<CacheTrait>::CacheAllocator(
       shmManager_(type != InitMemType::kNone
                       ? std::make_unique<ShmManager>(config_.cacheDir,
                                                      config_.isUsingPosixShm(),
-                                                     config_.hugePageMountDir)
+                                                     config_.hugePageMountDir,
+                                                     config_.posixShmDirectory)
                       : nullptr),
       deserializer_(type == InitMemType::kMemAttach ? createDeserializer()
                                                     : nullptr),
@@ -7048,12 +7050,13 @@ template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
     const std::string& cacheDir,
     bool posix,
-    const std::string& hugePageMountDir) {
+    const std::string& hugePageMountDir,
+    const std::string& posixShmDir) {
   if (util::getStatIfExists(cacheDir, nullptr) && util::isDir(cacheDir)) {
     try {
       // cache dir exists. clean up only if there are no other processes
       // attached. if another process was attached, the following would fail.
-      ShmManager::cleanup(cacheDir, posix, hugePageMountDir);
+      ShmManager::cleanup(cacheDir, posix, hugePageMountDir, posixShmDir);
     } catch (const std::exception& e) {
       XLOGF(ERR, "Error cleaning up {}. Exception: ", cacheDir, e.what());
       return false;
@@ -7063,13 +7066,13 @@ bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
     // Any other concurrent process can not be attached to the segments or
     // even if it does, we want to mark it for destruction.
     ShmManager::removeByName(cacheDir, detail::kShmInfoName, posix,
-                             hugePageMountDir);
+                             hugePageMountDir, posixShmDir);
     ShmManager::removeByName(cacheDir, detail::kShmCacheName, posix,
-                             hugePageMountDir);
+                             hugePageMountDir, posixShmDir);
     ShmManager::removeByName(cacheDir, detail::kShmHashTableName, posix,
-                             hugePageMountDir);
+                             hugePageMountDir, posixShmDir);
     ShmManager::removeByName(cacheDir, detail::kShmChainedItemHashTableName,
-                             posix, hugePageMountDir);
+                             posix, hugePageMountDir, posixShmDir);
   }
   return true;
 }
