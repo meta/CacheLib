@@ -18,7 +18,10 @@
 
 #include <fmt/core.h>
 #include <folly/Optional.h>
+#include <folly/synchronization/SanitizeThread.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -150,6 +153,30 @@ class ChainedHashTable {
 
     // gets the bucket for the key by using the corresponding hash function.
     BucketId getBucket(Key k) const noexcept;
+
+    // Prefetches the bucket slot. Batched lookups call this for every key
+    // first so that the slot cache misses of the whole batch overlap.
+    void prefetchBucket(BucketId bucket) const noexcept {
+      __builtin_prefetch(hashTable_.get() + bucket);
+    }
+
+    // Prefetches the first node of the bucket's chain. The slot is read without
+    // the bucket lock, so the pointer may be stale and is only prefetched.
+    // Only for 4-byte pointers, as a wider read could tear; the table is
+    // allocated or mapped with at least 4-byte alignment.
+    void prefetchBucketHead([[maybe_unused]] BucketId bucket) const noexcept {
+      if constexpr (sizeof(CompressedPtrType) == sizeof(uint32_t)) {
+        uint32_t raw;
+        {
+          folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
+          raw = __atomic_load_n(
+              reinterpret_cast<const uint32_t*>(hashTable_.get() + bucket),
+              __ATOMIC_RELAXED);
+        }
+        compressor_.prefetch(CompressedPtrType{
+            static_cast<typename CompressedPtrType::SerializedPtrType>(raw)});
+      }
+    }
 
     // Call 'func' on each element in the given bucket.
     //
@@ -515,6 +542,18 @@ class ChainedHashTable {
     // @throw std::overflow_error is the maximum item refcount is execeeded by
     //        creating this item handle.
     Handle find(Key key) const;
+
+    // Batched find(): handles[i] = find(keys[i]), with the bucket slots and
+    // chain heads prefetched ahead of the lookups.
+    //
+    // @param keys     keys to look up
+    // @param handles  output, same size as keys
+    //
+    // @throw std::overflow_error if the maximum item refcount is exceeded by
+    //        creating a handle
+    template <typename OutputHandle>
+    void findMany(folly::Range<const Key*> keys,
+                  folly::Range<OutputHandle*> handles) const;
 
     // for saving the state of the hash table
     //
@@ -1316,6 +1355,46 @@ typename T::Handle ChainedHashTable::Container<T, HookPtr, LockT>::find(
   const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockShared(bucket);
   return handleMaker_(ht_.findInBucket(key, bucket));
+}
+
+template <typename T,
+          typename ChainedHashTable::Hook<T> T::* HookPtr,
+          typename LockT>
+template <typename OutputHandle>
+void ChainedHashTable::Container<T, HookPtr, LockT>::findMany(
+    folly::Range<const Key*> keys, folly::Range<OutputHandle*> handles) const {
+  XDCHECK_EQ(keys.size(), handles.size());
+  // Bucket slots are prefetched one group of keys ahead of the chain heads,
+  // which can only be decoded once their slot has arrived. Groups of 8
+  // measured fastest.
+  constexpr size_t kGroup = 8;
+  std::array<BucketId, 2 * kGroup> buckets; // the current and the next group
+  const size_t n = keys.size();
+  auto prefetchSlots = [&](size_t first) {
+    for (size_t i = first; i < std::min(n, first + kGroup); ++i) {
+      buckets[i % buckets.size()] = ht_.getBucket(keys[i]);
+      ht_.prefetchBucket(buckets[i % buckets.size()]);
+    }
+  };
+  prefetchSlots(0);
+  for (size_t group = 0; group < n; group += kGroup) {
+    prefetchSlots(group + kGroup);
+    const size_t end = std::min(n, group + kGroup);
+    for (size_t i = group; i < end; ++i) {
+      ht_.prefetchBucketHead(buckets[i % buckets.size()]);
+    }
+    for (size_t i = group; i < end; ++i) {
+      const BucketId bucket = buckets[i % buckets.size()];
+      Handle handle;
+      {
+        auto l = locks_.lockShared(bucket);
+        handle = handleMaker_(ht_.findInBucket(keys[i], bucket));
+      }
+      // The old handle may hold the last reference to a removed item, whose
+      // release runs callbacks that must not run under the bucket lock.
+      handles[i] = std::move(handle);
+    }
+  }
 }
 
 template <typename T,
