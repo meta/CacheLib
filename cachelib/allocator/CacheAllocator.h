@@ -6359,6 +6359,7 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::stopWorkers(std::chrono::seconds timeout) {
   bool success = true;
+  success &= stopPoolOptimizer(timeout);
   success &= stopPoolRebalancer(timeout);
   success &= stopPoolResizer(timeout);
   success &= stopMemMonitor(timeout);

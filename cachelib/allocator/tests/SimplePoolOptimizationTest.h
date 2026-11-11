@@ -19,7 +19,10 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <future>
+#include <thread>
 
 #include "cachelib/allocator/CCacheAllocator.h"
 #include "cachelib/allocator/PoolOptimizer.h"
@@ -85,6 +88,34 @@ struct SimplePoolOptimizeStrategy : public PoolOptimizeStrategy {
 template <typename AllocatorT>
 class SimplePoolOptimizationTest : public testing::Test {
  public:
+  void testStopWorkersStopsPoolOptimizer() {
+    struct CountingStrategy : public PoolOptimizeStrategy {
+      std::atomic<int> calls{0};
+
+     protected:
+      PoolOptimizeContext pickVictimAndReceiverRegularPoolsImpl(
+          const CacheBase&) override {
+        ++calls;
+        return kNoOpContext;
+      }
+    };
+    auto strategy = std::make_shared<CountingStrategy>();
+    typename AllocatorT::Config config;
+    config.setCacheSize(30 * Slab::kSize);
+    config.enablePoolOptimizer(strategy, std::chrono::seconds{1},
+                               std::chrono::seconds{1}, 1);
+    AllocatorT alloc(config);
+    for (int i = 0; i < 100 && strategy->calls == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    ASSERT_GT(strategy->calls.load(), 0);
+
+    ASSERT_TRUE(alloc.stopWorkers());
+    const int calls = strategy->calls.load();
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    EXPECT_EQ(calls, strategy->calls.load());
+  }
+
   void testPoolOptimizerBasic() {
     typename AllocatorT::Config config;
     config.setCacheSize(30 * Slab::kSize);
