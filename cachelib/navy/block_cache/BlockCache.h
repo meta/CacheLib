@@ -60,6 +60,16 @@ class BlockCache final : public Engine {
     // CRC-32 preserves existing persisted caches. Selecting CRC-32C changes
     // the persisted format and requires a cold cache when changing modes.
     ChecksumType checksumType{ChecksumType::Crc32};
+    // Offload value CRC32C and write copies to DSA, with CRC32C CPU fallback.
+    // Requires checksum=true and checksumType=Crc32c.
+    bool checksumOffload{false};
+    // Minimum value size in bytes for fused copy/checksum offload.
+    uint32_t checksumOffloadMinSize{16384};
+    // Minimum value size in bytes for verification offload.
+    // 0 uses checksumOffloadMinSize; UINT32_MAX disables verification offload.
+    uint32_t checksumOffloadReadMinSize{0};
+    // DSA copy cache hint: enable when CPU reuse is expected.
+    bool checksumOffloadCacheControl{true};
     // Base offset and size (in bytes) of cache on the device
     uint64_t cacheBaseOffset{};
     uint64_t cacheSize{};
@@ -556,6 +566,14 @@ class BlockCache final : public Engine {
   const DestructorCallback destructorCb_;
   const bool checksumData_{};
   const ChecksumType checksumType_;
+
+  const bool checksumOffload_{};
+  const uint32_t checksumOffloadMinSize_{};
+  const uint32_t checksumOffloadReadMinSize_{};
+  const bool checksumOffloadCacheControl_{};
+
+  // Computes a value checksum; may yield while waiting for DSA.
+  uint32_t valueChecksum(BufferView value) const;
   // reference to the under-lying device.
   const Device& device_;
   // alloc alignment size indicates the granularity of entry sizes on device.

@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 #include <folly/File.h>
+#include <folly/hash/Checksum.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -245,6 +246,63 @@ TEST(BlockCache, InsertLookup) {
   EXPECT_EQ(16, hits[1]);
   EXPECT_EQ(0, hits[2]);
   EXPECT_EQ(0, hits[3]);
+}
+
+TEST(BlockCache, InsertLookupChecksumOffload) {
+  std::vector<CacheEntry> log;
+
+  std::vector<uint32_t> hits(4);
+  auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
+  auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+  auto ex = makeJobScheduler();
+  auto config = makeConfig(std::move(policy), *device);
+  config.checksum = true;
+  config.checksumOffload = true;
+  config.checksumType = ChecksumType::Crc32c;
+  // Exercise the fused path for every value, including CPU fallback.
+  config.checksumOffloadMinSize = 0;
+  auto engine = makeEngine(std::move(config));
+  auto driver = makeDriver(std::move(engine), std::move(ex));
+
+  BufferGen bg;
+  for (size_t i = 0; i < 16; i++) {
+    CacheEntry e{bg.gen(8), bg.gen(i % 2 == 0 ? 800 : 3000)};
+    EXPECT_EQ(Status::Ok,
+              driver->insertAsync(e.key(), e.value(), nullptr, 0 /* poolId */,
+                                  0 /* expiryTime */));
+    log.push_back(std::move(e));
+  }
+  driver->flush();
+
+  for (auto& e : log) {
+    Buffer value;
+    uint32_t lat = 0;
+    EXPECT_EQ(Status::Ok, driver->lookup(e.key(), value, lat));
+    EXPECT_EQ(e.value(), value.view());
+  }
+
+  driver->getCounters(
+      {[](folly::StringPiece name, double count, CounterVisitor::CounterType) {
+        if (name.contains("checksum_error")) {
+          EXPECT_EQ(0, count) << name;
+        }
+      }});
+}
+
+TEST(BlockCache, ChecksumOffloadRequiresCrc32c) {
+  auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+  auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);
+  config.checksum = true;
+  config.checksumOffload = true;
+  EXPECT_EQ(ChecksumType::Crc32, config.checksumType);
+  EXPECT_THROW(config.validate(), std::invalid_argument);
+
+  config.checksumType = ChecksumType::Crc32c;
+  config.checksum = false;
+  EXPECT_THROW(config.validate(), std::invalid_argument);
+
+  config.checksum = true;
+  EXPECT_NO_THROW(config.validate());
 }
 
 TEST(BlockCache, WriteEntry_AlignedEntries_TracksSerializedAndPaddingBytes) {
@@ -693,7 +751,8 @@ TEST(BlockCache, HoleStats) {
   }});
 }
 
-TEST(BlockCache, ReclaimCorruption) {
+namespace {
+void testReclaimCorruption(bool checksumOffload) {
   // This test verifies two behaviors in BlockCache regarding corruption during
   // reclaim. In the case of an item's entry header corruption, we must abort
   // the reclaim as we don't have a way to ensure we will safely proceed to read
@@ -706,6 +765,11 @@ TEST(BlockCache, ReclaimCorruption) {
   auto ex = makeJobScheduler();
   auto config = makeConfig(std::move(policy), *device);
   config.checksum = true;
+  if (checksumOffload) {
+    config.checksumType = ChecksumType::Crc32c;
+    config.checksumOffload = true;
+    config.checksumOffloadMinSize = 0;
+  }
   // Use 100% reinsertion so all items are eligible for reinsertion
   // so that value checksuming will occur
   config.reinsertionConfig = makePctReinsertionConfig(100);
@@ -787,6 +851,13 @@ TEST(BlockCache, ReclaimCorruption) {
       EXPECT_EQ(2, count);
     }
   }});
+}
+} // namespace
+
+TEST(BlockCache, ReclaimCorruption) { testReclaimCorruption(false); }
+
+TEST(BlockCache, ReclaimCorruptionChecksumOffload) {
+  testReclaimCorruption(true);
 }
 
 TEST(BlockCache, StackAlloc) {
@@ -1724,6 +1795,81 @@ TEST(BlockCache, ChecksumTypePersistence) {
   }
 }
 
+TEST(BlockCache, ChecksumOffloadPreservesCrc32cFormat) {
+  for (bool writeOffload : {false, true}) {
+    SCOPED_TRACE(testing::Message() << "write offload=" << writeOffload);
+    auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+    auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);
+    config.checksum = true;
+    config.checksumType = ChecksumType::Crc32c;
+    config.checksumOffload = writeOffload;
+    config.checksumOffloadMinSize = 1024;
+    // Verify writes on the CPU, independently of the write offload setting.
+    config.checksumOffloadReadMinSize = 4096;
+    auto engine = makeEngine(std::move(config));
+    auto* blockCache = static_cast<BlockCache*>(engine.get());
+    auto driver = makeDriver(std::move(engine), makeJobScheduler());
+    BufferGen bg;
+    std::vector<CacheEntry> entries;
+    entries.emplace_back(strzBuffer("small"), strzBuffer("123456789"));
+    entries.emplace_back(strzBuffer("below-threshold"), bg.gen(1023));
+    entries.emplace_back(strzBuffer("at-threshold"), bg.gen(1024));
+    entries.emplace_back(strzBuffer("large"), bg.gen(2048));
+    for (const auto& entry : entries) {
+      ASSERT_EQ(Status::Ok, driver->insert(entry.key(), entry.value()));
+    }
+    driver->flush();
+
+    // Check stored checksums against Folly across the offload threshold.
+    for (const auto& indexed : blockCache->index()) {
+      auto result = blockCache->lookup(indexed);
+      ASSERT_TRUE(result.hasValue());
+      const auto expected =
+          folly::crc32c(result->value().data(), result->value().size(), 0);
+      auto buffer = result->releaseBuffer();
+      constexpr size_t kValueChecksumOffset = 24;
+      uint32_t storedChecksum;
+      std::memcpy(&storedChecksum,
+                  buffer.data() + buffer.size() - kSizeOfEntryDesc +
+                      kValueChecksumOffset,
+                  sizeof(storedChecksum));
+      EXPECT_EQ(expected, storedChecksum);
+    }
+
+    folly::IOBufQueue metadata;
+    auto metadataWriter = createMemoryRecordWriter(metadata);
+    blockCache->persist(*metadataWriter);
+    auto metadataReader = createMemoryRecordReader(metadata);
+    auto persisted =
+        deserializeProto<serialization::BlockCacheConfig>(*metadataReader);
+    EXPECT_EQ(14, *persisted.version());
+
+    folly::IOBufQueue recoveryData;
+    auto writer = createMemoryRecordWriter(recoveryData);
+    blockCache->persist(*writer);
+    driver.reset();
+
+    auto recoveredConfig = makeConfig(std::make_unique<FifoPolicy>(), *device);
+    recoveredConfig.checksum = true;
+    recoveredConfig.checksumType = ChecksumType::Crc32c;
+    recoveredConfig.checksumOffload = !writeOffload;
+    recoveredConfig.checksumOffloadMinSize = 1024;
+    auto recoveredEngine = makeEngine(std::move(recoveredConfig));
+    auto reader = createMemoryRecordReader(recoveryData);
+    ASSERT_TRUE(recoveredEngine->recover(*reader));
+    auto recoveredDriver =
+        makeDriver(std::move(recoveredEngine), makeJobScheduler());
+    for (const auto& entry : entries) {
+      Buffer value;
+      uint32_t lastAccessTimeSecs = 0;
+      ASSERT_EQ(
+          Status::Ok,
+          recoveredDriver->lookup(entry.key(), value, lastAccessTimeSecs));
+      EXPECT_EQ(entry.value(), value.view());
+    }
+  }
+}
+
 TEST(BlockCache, RecoveryWithDifferentCacheSize) {
   std::vector<uint32_t> hits(4);
   size_t metadataSize = 3 * 1024 * 1024;
@@ -2138,7 +2284,8 @@ TEST(BlockCache, Checksum) {
   EXPECT_EQ(0, exPtr->getQueueSize());
 }
 
-TEST(BlockCache, HitsReinsertionPolicy) {
+namespace {
+void testHitsReinsertionPolicy(bool checksumOffload) {
   std::vector<uint32_t> hits(4);
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
@@ -2146,6 +2293,12 @@ TEST(BlockCache, HitsReinsertionPolicy) {
   auto config = makeConfig(std::move(policy), *device);
   config.checksum = true;
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
+  if (checksumOffload) {
+    config.checksum = true;
+    config.checksumType = ChecksumType::Crc32c;
+    config.checksumOffload = true;
+    config.checksumOffloadMinSize = 0;
+  }
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -2252,6 +2405,13 @@ TEST(BlockCache, HitsReinsertionPolicy) {
     EXPECT_EQ(Status::Ok, driver->lookup(log[i].key(), value, lat));
     EXPECT_EQ(log[i].value(), value.view());
   }
+}
+} // namespace
+
+TEST(BlockCache, HitsReinsertionPolicy) { testHitsReinsertionPolicy(false); }
+
+TEST(BlockCache, HitsReinsertionPolicyChecksumOffload) {
+  testHitsReinsertionPolicy(true);
 }
 
 TEST(BlockCache, HitsReinsertionPolicyRecovery) {
@@ -2466,6 +2626,40 @@ TEST(BlockCache, DeviceFlushFailureSync) {
       EXPECT_EQ(1, count);
     }
   }});
+}
+
+TEST(BlockCache, ChecksumOffloadFlushFailureCleanup) {
+  BufferGen bg;
+  CacheEntry entry{strzBuffer("cleanup-key"), bg.gen(800)};
+  MockDestructor destructor;
+  EXPECT_CALL(destructor,
+              call(entry.key(), entry.value(), DestructorEvent::Recycled));
+  auto device = std::make_unique<MockDevice>(kDeviceSize, 1024);
+  EXPECT_CALL(*device, writeImpl(_, _, _, _)).WillRepeatedly(Return(false));
+  auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);
+  config.checksum = true;
+  config.checksumType = ChecksumType::Crc32c;
+  config.checksumOffload = true;
+  config.checksumOffloadMinSize = 0;
+  config.inMemBufFlushRetryLimit = kFlushRetryLimit;
+  config.destructorCb = toCallback(destructor);
+  auto driver = makeDriver(makeEngine(std::move(config)), makeJobScheduler());
+
+  ASSERT_EQ(Status::Ok, driver->insert(entry.key(), entry.value()));
+  driver->flush();
+
+  Buffer value;
+  uint32_t lastAccessTimeSecs = 0;
+  EXPECT_EQ(Status::NotFound,
+            driver->lookup(entry.key(), value, lastAccessTimeSecs));
+  std::map<std::string, double> counters;
+  driver->getCounters(
+      {[&](folly::StringPiece name, double count, CounterVisitor::CounterType) {
+        counters[name.str()] = count;
+      }});
+  EXPECT_EQ(1, counters.at("navy_bc_inmem_flush_failures"));
+  EXPECT_EQ(0, counters.at("navy_bc_cleanup_entry_header_checksum_errors"));
+  EXPECT_EQ(0, counters.at("navy_bc_cleanup_value_checksum_errors"));
 }
 
 TEST(BlockCache, DeviceFlushFailureAsync) {
