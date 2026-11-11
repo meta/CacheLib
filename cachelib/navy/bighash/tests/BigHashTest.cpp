@@ -80,6 +80,68 @@ TEST(BigHash, InsertAndRemove) {
   EXPECT_EQ(Status::NotFound, bh.remove(makeHK("key")));
 }
 
+TEST(BigHash, RejectsChecksumOffloadWithCrc32) {
+  BigHash::Config config;
+  setLayout(config, 4096, 1);
+  config.checksumOffload = true;
+  auto device = createMemoryDevice(config.cacheSize, nullptr /* encryption */);
+  config.device = device.get();
+
+  EXPECT_THROW(BigHash{std::move(config)}, std::invalid_argument);
+}
+
+TEST(BigHash, ChecksumOffloadMinSize) {
+  BigHash::Config config;
+  config.checksumOffload = true;
+  // Default 4KB buckets are below the default threshold.
+  EXPECT_FALSE(config.usesChecksumOffload());
+
+  config.bucketSize = config.checksumOffloadMinSize;
+  EXPECT_TRUE(config.usesChecksumOffload());
+
+  config.bucketSize = 128;
+  config.checksumOffloadMinSize = 0;
+  EXPECT_TRUE(config.usesChecksumOffload());
+
+  config.checksumOffload = false;
+  EXPECT_FALSE(config.usesChecksumOffload());
+}
+
+// Exercises the offloaded bucket-checksum path (DSA when built with DTO
+// support, software otherwise), including the bloom-filter-rebuild overlap
+// in insert/remove and offloaded verification in readBucket.
+TEST(BigHash, InsertRemoveChecksumOffload) {
+  BigHash::Config config;
+  setLayout(config, 128, 2);
+  config.checksumType = ChecksumType::Crc32c;
+  config.checksumOffload = true;
+  config.checksumOffloadMinSize = 0;
+  config.bloomFilter = std::make_unique<BloomFilter>(config.numBuckets(), 2, 4);
+  auto device = std::make_unique<NiceMock<MockDevice>>(config.cacheSize, 128);
+  config.device = device.get();
+
+  BigHash bh(std::move(config));
+
+  Buffer value;
+  uint32_t lat = 0;
+  EXPECT_FALSE(bh.couldExist(makeHK("key")));
+  ASSERT_EQ(Status::Ok,
+            bh.insert(makeHK("key"), makeView("12345"), 0 /* poolId */,
+                      0 /* expiryTime */));
+  EXPECT_TRUE(bh.couldExist(makeHK("key")));
+  ASSERT_EQ(Status::Ok, bh.lookup(makeHK("key"), value, lat));
+  EXPECT_EQ(makeView("12345"), value.view());
+
+  ASSERT_EQ(Status::Ok, bh.insert(makeHK("key"), makeView("67890")));
+  EXPECT_TRUE(bh.couldExist(makeHK("key")));
+  ASSERT_EQ(Status::Ok, bh.lookup(makeHK("key"), value, lat));
+  EXPECT_EQ(makeView("67890"), value.view());
+
+  ASSERT_EQ(Status::Ok, bh.remove(makeHK("key")));
+  EXPECT_FALSE(bh.couldExist(makeHK("key")));
+  EXPECT_EQ(Status::NotFound, bh.lookup(makeHK("key"), value, lat));
+}
+
 // without bloom filters, could exist always returns true.
 TEST(BigHash, CouldExistWithoutBF) {
   BigHash::Config config;
@@ -512,25 +574,38 @@ TEST(BigHash, Recovery) {
 
 TEST(BigHash, ChecksumFormatCompatibility) {
   constexpr uint32_t kBucketSize = 4096;
-  for (auto writeType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
-    for (auto recoverType : {ChecksumType::Crc32, ChecksumType::Crc32c}) {
+  struct ChecksumMode {
+    ChecksumType type;
+    bool offload;
+  };
+  const ChecksumMode modes[]{{ChecksumType::Crc32, false},
+                             {ChecksumType::Crc32c, false},
+                             {ChecksumType::Crc32c, true}};
+  for (const auto writeMode : modes) {
+    for (const auto recoverMode : modes) {
+      const auto writeType = writeMode.type;
+      const auto recoverType = recoverMode.type;
       SCOPED_TRACE(testing::Message()
                    << "write=" << static_cast<int>(writeType)
-                   << " recover=" << static_cast<int>(recoverType));
+                   << " offload=" << writeMode.offload
+                   << " recover=" << static_cast<int>(recoverType)
+                   << " offload=" << recoverMode.offload);
       auto device = createMemoryDevice(kBucketSize, nullptr /* encryption */);
-      auto makeConfig = [&](ChecksumType checksumType) {
+      auto makeConfig = [&](ChecksumMode mode) {
         BigHash::Config config;
         setLayout(config, kBucketSize, 1);
         config.device = device.get();
-        if (checksumType == ChecksumType::Crc32c) {
-          config.checksumType = checksumType;
+        if (mode.type == ChecksumType::Crc32c) {
+          config.checksumType = mode.type;
         }
+        config.checksumOffload = mode.offload;
+        config.checksumOffloadMinSize = 0;
         return config;
       };
 
       folly::IOBufQueue queue;
       {
-        BigHash writer(makeConfig(writeType));
+        BigHash writer(makeConfig(writeMode));
         ASSERT_EQ(Status::Ok, writer.insert(makeHK("key"), makeView("value")));
 
         auto bucketData = device->makeIOBuffer(kBucketSize);
@@ -555,7 +630,7 @@ TEST(BigHash, ChecksumFormatCompatibility) {
         writer.persist(*rw);
       }
 
-      BigHash recovered(makeConfig(recoverType));
+      BigHash recovered(makeConfig(recoverMode));
       auto rr = createMemoryRecordReader(queue);
       const bool sameFormat = writeType == recoverType;
       ASSERT_EQ(sameFormat, recovered.recover(*rr));

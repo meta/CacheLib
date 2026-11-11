@@ -32,6 +32,10 @@ namespace facebook::cachelib::navy {
 constexpr uint32_t kBigHashValidBucketCheckerBucketsPerBit = 100;
 
 BigHash::Config& BigHash::Config::validate() {
+  if (checksumOffload && checksumType != ChecksumType::Crc32c) {
+    throw std::invalid_argument("BigHash checksum offload requires CRC32C");
+  }
+
   if (cacheSize < bucketSize) {
     throw std::invalid_argument(
         fmt::format("cache size: {} cannot be smaller than bucket size: {}",
@@ -87,6 +91,7 @@ BigHash::BigHash(Config&& config, ValidConfigTag)
         }
       }},
       bucketSize_{config.bucketSize},
+      checksumOffload_{config.usesChecksumOffload()},
       cacheBaseOffset_{config.cacheBaseOffset},
       numBuckets_{config.numBuckets()},
       bloomFilter_{std::move(config.bloomFilter)},
@@ -96,11 +101,12 @@ BigHash::BigHash(Config&& config, ValidConfigTag)
       bfLock_(numMutexes_) {
   XLOGF(INFO,
         "BigHash created: buckets: {}, bucket size: {}, base offset: {}, num "
-        "mutexes: {}",
+        "mutexes: {}, checksum offload: {}",
         numBuckets_,
         bucketSize_,
         cacheBaseOffset_,
-        numMutexes_);
+        numMutexes_,
+        checksumOffload_);
   reset();
 }
 
@@ -367,16 +373,17 @@ Status BigHash::insert(HashedKey hk,
         bucket->insert(hk, value, checkExpired_, cb);
     newRemainingBytes = bucket->remainingBytes();
 
-    // rebuild / fix the bloom filter before we move the buffer to do the
-    // actual write
-    if (removed + evicted == 0) {
-      // In case nothing was removed or evicted, we can just add
-      bfSet(bid, hk.keyHash());
-    } else {
-      bfRebuild(bid, bucket);
-    }
-
-    const auto res = writeBucket(bid, std::move(buffer));
+    // The bloom filter update runs as overlap work: concurrently with the
+    // bucket checksum when offloaded to DSA, right before it otherwise. In
+    // both cases it completes before the bucket is written to the device.
+    const auto res = writeBucket(bid, std::move(buffer), [&] {
+      if (removed + evicted == 0) {
+        // In case nothing was removed or evicted, we can just add
+        bfSet(bid, hk.keyHash());
+      } else {
+        bfRebuild(bid, bucket);
+      }
+    });
     if (!res) {
       bfClear(bid);
       ioErrorCount_.inc();
@@ -513,11 +520,11 @@ Status BigHash::remove(HashedKey hk) {
     }
     newRemainingBytes = bucket->remainingBytes();
 
-    // We compute bloom filter before writing the bucket because when encryption
-    // is enabled, we will "move" the bucket content into writeBucket().
-    bfRebuild(bid, bucket);
-
-    const auto res = writeBucket(bid, std::move(buffer));
+    // The bloom filter rebuild runs as overlap work: concurrently with the
+    // bucket checksum when offloaded to DSA, right before it otherwise. In
+    // both cases it completes before the bucket is written to the device.
+    const auto res =
+        writeBucket(bid, std::move(buffer), [&] { bfRebuild(bid, bucket); });
     if (!res) {
       bfClear(bid);
       ioErrorCount_.inc();
@@ -608,8 +615,10 @@ Buffer BigHash::readBucket(BucketId bid) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
 
   auto checksumCheck = [this](auto* b, auto bufferView) {
-    const bool checksumSuccess =
-        Bucket::computeChecksum(bufferView, checksumType_) == b->getChecksum();
+    const uint32_t computed =
+        checksumOffload_ ? Bucket::computeChecksumOffloaded(bufferView, [] {})
+                         : Bucket::computeChecksum(bufferView, checksumType_);
+    const bool checksumSuccess = computed == b->getChecksum();
     // TODO (T93631284) we only read a bucket if the bloom filter indicates that
     // the bucket could have the element. Hence, if check sum errors out and
     // bloom filter is enabled, we could record the checksum error. However,
@@ -633,9 +642,17 @@ Buffer BigHash::readBucket(BucketId bid) {
   return buffer;
 }
 
-bool BigHash::writeBucket(BucketId bid, Buffer buffer) {
+bool BigHash::writeBucket(BucketId bid,
+                          Buffer buffer,
+                          folly::FunctionRef<void()> overlap) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
-  bucket->setChecksum(Bucket::computeChecksum(buffer.view(), checksumType_));
+  if (checksumOffload_) {
+    bucket->setChecksum(
+        Bucket::computeChecksumOffloaded(buffer.view(), overlap));
+  } else {
+    overlap();
+    bucket->setChecksum(Bucket::computeChecksum(buffer.view(), checksumType_));
+  }
   const bool res =
       device_.write(getBucketOffset(bid), std::move(buffer), placementHandle_);
   if (!res) {

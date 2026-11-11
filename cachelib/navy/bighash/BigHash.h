@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <folly/Function.h>
 #include <folly/Utility.h>
 #include <folly/fibers/TimedMutex.h>
 
@@ -67,6 +68,16 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
     uint32_t bucketSize{4 * 1024};
     ChecksumType checksumType{ChecksumType::Crc32};
 
+    // Offload bucket checksumming to Intel DSA via the DTO library when
+    // available. Most beneficial with large buckets (16KB+), where the bloom
+    // filter rebuild overlaps with the accelerator computing the checksum.
+    // Requires checksumType == ChecksumType::Crc32c. Uses software
+    // CRC32C when built without DTO support or DSA is unavailable.
+    bool checksumOffload{false};
+    // Minimum bucketSize in bytes for checksum offload. Smaller buckets use
+    // software CRC32C.
+    uint32_t checksumOffloadMinSize{16384};
+
     // The range of device that BigHash will access is guaranteed to be
     // within [baseOffset, baseOffset + cacheSize)
     uint64_t cacheBaseOffset{};
@@ -82,6 +93,10 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
     uint8_t numMutexesPower{14};
 
     uint64_t numBuckets() const { return cacheSize / bucketSize; }
+
+    bool usesChecksumOffload() const {
+      return checksumOffload && bucketSize >= checksumOffloadMinSize;
+    }
 
     Config& validate();
   };
@@ -188,7 +203,13 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
   BigHash(Config&& config, ValidConfigTag);
 
   Buffer readBucket(BucketId bid);
-  bool writeBucket(BucketId bid, Buffer buffer);
+
+  // Checksums the bucket and writes it to the device. @overlap is CPU work
+  // (e.g. bloom filter maintenance) run while the checksum is computed by
+  // DSA when checksum offload is enabled, or immediately before the software
+  // checksum otherwise. It may read the bucket but must not modify it.
+  bool writeBucket(
+      BucketId bid, Buffer buffer, folly::FunctionRef<void()> overlap = [] {});
 
   // The corresponding r/w bucket lock must be held during the entire
   // duration of the read and write operations. For example, during write,
@@ -237,6 +258,9 @@ class BigHash final : public Engine, folly::NonCopyableNonMovable {
   const ExpiredCheck checkExpired_{};
   const DestructorCallback destructorCb_{};
   const uint64_t bucketSize_{};
+  // Whether to offload bucket checksumming to DSA. See
+  // Config::usesChecksumOffload.
+  const bool checksumOffload_{};
   const uint64_t cacheBaseOffset_{};
   const uint64_t numBuckets_{};
   std::unique_ptr<BloomFilter> bloomFilter_;
