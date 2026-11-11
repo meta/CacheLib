@@ -53,7 +53,7 @@ struct AllocationClassObject {
   4: required i64 currOffset;
   @thrift.AllowUnsafeRequiredFieldQualifier
   8: required bool canAllocate;
-  9: SListObject freedAllocationsObject;
+  9: objects.SListObject freedAllocationsObject;
   @thrift.AllowUnsafeRequiredFieldQualifier
   10: required i32 currSlabIdx;
   @thrift.AllowUnsafeRequiredFieldQualifier

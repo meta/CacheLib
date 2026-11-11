@@ -101,7 +101,7 @@ struct MMLruObject {
   @thrift.AllowUnsafeRequiredFieldQualifier
   7: required i64 tailSize;
   @thrift.AllowUnsafeRequiredFieldQualifier
-  8: required DListObject lru;
+  8: required objects.DListObject lru;
   @thrift.AllowUnsafeRequiredFieldQualifier
   9: required i64 compressedInsertionPoint;
 }
@@ -136,7 +136,7 @@ struct MM2QObject {
 
   // Warm, hot and cold lrus
   @thrift.AllowUnsafeRequiredFieldQualifier
-  12: required MultiDListObject lrus;
+  12: required objects.MultiDListObject lrus;
 }
 
 struct MM2QCollection {
@@ -171,7 +171,7 @@ struct MMTinyLFUObject {
 
   // Warm, hot and cold lrus
   @thrift.AllowUnsafeRequiredFieldQualifier
-  3: required MultiDListObject lrus;
+  3: required objects.MultiDListObject lrus;
 }
 
 struct MMTinyLFUCollection {
@@ -196,7 +196,7 @@ struct MMTTLBucketObject {
   4: i64 expirationTime;
   5: i64 creationTime;
   @thrift.AllowUnsafeRequiredFieldQualifier
-  6: required DListObject dList;
+  6: required objects.DListObject dList;
 }
 
 struct TTLBucketCollection {
