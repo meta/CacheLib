@@ -99,7 +99,7 @@ const Buffer::Slot* Buffer::getSlot(uint32_t dataOffset) const {
 const Buffer::Slot* Buffer::getSlotImpl(uint32_t dataOffset) const {
   if (dataOffset >= nextByte_ || dataOffset < sizeof(Slot)) {
     // Need this to compile due to alignment requirement for uint32_t& in
-    // folly::sformat()
+    // fmt::format()
     const auto tmp = nextByte_;
     throw std::invalid_argument(fmt::format(
         "invliad dataOffset. dataOffset: {}, nextByte: {}, sizeof(Slot): {}",
