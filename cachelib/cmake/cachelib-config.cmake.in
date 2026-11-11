@@ -35,6 +35,10 @@ find_dependency(fizz )
 find_dependency(wangle)
 find_dependency(thrift CONFIG)
 
+if (@BUILD_WITH_DTO@)
+  find_dependency(DTO 1.2 CONFIG)
+endif()
+
 if (NOT TARGET cachelib)
 	include("${CACHELIB_CMAKE_DIR}/cachelib-targets.cmake")
 endif()

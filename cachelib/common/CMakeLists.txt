@@ -51,6 +51,16 @@ target_link_libraries(cachelib_common PUBLIC
   ${XXHASH_LIBRARY}
 )
 
+if (BUILD_WITH_DTO)
+  if (NOT TARGET DTO::dto_explicit)
+    message(FATAL_ERROR
+      "BUILD_WITH_DTO requires DTO::dto_explicit. "
+      "Build DTO with DTO_BUILD_EXPLICIT=ON.")
+  endif()
+  target_link_libraries(cachelib_common PUBLIC DTO::dto_explicit)
+  target_compile_definitions(cachelib_common PUBLIC CACHELIB_BUILD_WITH_DTO)
+endif()
+
 install(TARGETS cachelib_common
         EXPORT cachelib-exports
         DESTINATION ${LIB_INSTALL_DIR} )

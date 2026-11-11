@@ -44,6 +44,18 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_TESTS "If enabled, compile the tests." ON)
 
+option(BUILD_WITH_DTO
+  "If enabled, build with the DTO library for Intel DSA offload support." OFF)
+
+if (BUILD_WITH_DTO)
+  if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+      NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    message(FATAL_ERROR
+      "BUILD_WITH_DTO is supported only on Linux x86_64 "
+      "(target: ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+endif()
+
 
 set(BIN_INSTALL_DIR bin CACHE STRING
     "The subdirectory where binaries should be installed")
@@ -309,6 +321,45 @@ endfunction()
 
 add_thrift_file(OBJECT_CACHE_PERSISTENCE
                 object_cache/persistence/persistent_data.thrift json)
+
+if (BUILD_WITH_DTO)
+  # The DSA checksum offload code uses DTO's explicit asynchronous API
+  # (caller-allocated submit/poll operations, batches, raw CRC32C), which
+  # requires DTO 1.2 or later.
+  set(CACHELIB_DTO_GIT_REPOSITORY "https://github.com/intel/DTO.git"
+      CACHE STRING "Git repository for DTO when no installed copy is found")
+  # Tag v1.2.
+  set(CACHELIB_DTO_GIT_TAG "7eb15200bcd95cf8a49d018856eb647b6f4e0ae9"
+      CACHE STRING "DTO revision to fetch when no installed copy is found")
+
+  find_package(DTO 1.2 CONFIG QUIET)
+  if (DTO_FOUND)
+    message(STATUS "Using installed DTO package: ${DTO_DIR} "
+      "(version ${DTO_VERSION})")
+  else()
+    if (CMAKE_VERSION VERSION_LESS 3.14)
+      message(FATAL_ERROR
+        "BUILD_WITH_DTO needs an installed DTO cmake package or "
+        "CMake >= 3.14 to fetch one. Install DTO from "
+        "${CACHELIB_DTO_GIT_REPOSITORY} at ${CACHELIB_DTO_GIT_TAG}, "
+        "or upgrade CMake.")
+    endif()
+    # DTO also requires libaccel-config; NUMA was resolved above.
+    find_library(ACCEL_CONFIG_LIBRARY accel-config)
+    if (NOT ACCEL_CONFIG_LIBRARY)
+      message(FATAL_ERROR
+        "BUILD_WITH_DTO requires the libaccel-config development package "
+        "(e.g. apt install libaccel-config-dev)")
+    endif()
+    message(STATUS "DTO not installed; fetching "
+      "${CACHELIB_DTO_GIT_REPOSITORY} @ ${CACHELIB_DTO_GIT_TAG}")
+    include(FetchContent)
+    FetchContent_Declare(dto
+      GIT_REPOSITORY "${CACHELIB_DTO_GIT_REPOSITORY}"
+      GIT_TAG "${CACHELIB_DTO_GIT_TAG}")
+    FetchContent_MakeAvailable(dto)
+  endif()
+endif()
 
 add_subdirectory (common)
 add_subdirectory (shm)

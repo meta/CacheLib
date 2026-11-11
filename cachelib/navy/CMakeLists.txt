@@ -32,6 +32,7 @@ add_library (cachelib_navy
   block_cache/RegionManager.cpp
   block_cache/SparseMapIndex.cpp
   common/Buffer.cpp
+  common/ChecksumOffload.cpp
   common/Device.cpp
   common/FdpNvme.cpp
   common/Hash.cpp
@@ -96,6 +97,7 @@ if (BUILD_TESTS)
   endfunction()
 
   add_source_test (common/tests/BufferTest.cpp)
+  add_source_test (common/tests/ChecksumOffloadTest.cpp)
   add_source_test (common/tests/HashTest.cpp)
   add_source_test (common/tests/UtilsTest.cpp)
   add_source_test (bighash/tests/BucketStorageTest.cpp)
