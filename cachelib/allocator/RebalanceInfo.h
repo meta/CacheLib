@@ -47,6 +47,13 @@ struct Info {
   // accumulative number of hits in the tail slab of this allocation class
   uint64_t accuTailHits{0};
 
+  double decayedAccuTailHits{0.0};
+
+  // accumalative number of requests seen for this allocation class
+  uint64_t numRequests{0};
+
+  uint64_t numRequestsAtLastDecay{0};
+
   // TODO(sugak) this is changed to unblock the LLVM upgrade The fix is not
   // completely understood, but it's a safe change T16521551 - Info() noexcept
   // = default;
@@ -55,8 +62,11 @@ struct Info {
        unsigned long long slabs,
        unsigned long long evicts,
        uint64_t h,
-       uint64_t th) noexcept
-      : id(_id), nSlabs(slabs), evictions(evicts), hits(h), accuTailHits(th) {}
+       uint64_t th,
+       double dath,
+       uint64_t nr,
+       uint64_t nrld) noexcept
+      : id(_id), nSlabs(slabs), evictions(evicts), hits(h), accuTailHits(th), decayedAccuTailHits(dath), numRequests(nr), numRequestsAtLastDecay(nrld) {}
 
   // number of rounds we hold off for when we acquire a slab.
   static constexpr unsigned int kNumHoldOffRounds = 10;
@@ -99,6 +109,22 @@ struct Info {
     }
 
     return poolStats.numHitsForClass(id) - hits;
+  }
+
+  uint64_t deltaRequests(const PoolStats& poolStats) const {
+    const auto& cacheStats = poolStats.cacheStats.at(id);
+    auto totalRequests = poolStats.numHitsForClass(id) + cacheStats.allocAttempts;
+    return totalRequests > numRequests
+        ? totalRequests - numRequests
+        : 0;
+  }
+
+  uint64_t deltaRequestsSinceLastDecay(const PoolStats& poolStats) const {
+    const auto& cacheStats = poolStats.cacheStats.at(id);
+    auto totalRequests = poolStats.numHitsForClass(id) + cacheStats.allocAttempts;
+    return totalRequests > numRequestsAtLastDecay
+        ? totalRequests - numRequestsAtLastDecay
+        : 0;
   }
 
   // return the delta of alloc failures for this alloc class from the current
@@ -144,6 +170,11 @@ struct Info {
            accuTailHits;
   }
 
+  double getDecayedMarginalHits(const PoolStats& poolStats, double decayFactor=0.0) const {
+    // decayed past + now
+    return decayedAccuTailHits + getMarginalHits(poolStats) * (1 - decayFactor);
+  }
+
   // returns true if the hold off is active for this alloc class.
   bool isOnHoldOff() const noexcept { return holdOffRemaining > 0; }
 
@@ -161,6 +192,19 @@ struct Info {
   void updateHits(const PoolStats& poolStats) noexcept {
     hits = poolStats.numHitsForClass(id);
   }
+
+  void updateRequests(const PoolStats& poolStats) noexcept {
+    const auto& cacheStats = poolStats.cacheStats.at(id);
+    numRequests = poolStats.numHitsForClass(id) + cacheStats.allocAttempts;
+  }
+
+  void updateTailHits(const PoolStats& poolStats, double decayFactor=0.0) noexcept {
+    const auto& cacheStats = poolStats.cacheStats.at(id);
+    decayedAccuTailHits = (decayedAccuTailHits + getMarginalHits(poolStats)) * decayFactor;
+    accuTailHits = cacheStats.containerStat.numTailAccesses;
+    numRequestsAtLastDecay = poolStats.numHitsForClass(id) + cacheStats.allocAttempts;
+  }
+
 
   // updates the current record to store the current state of slabs and the
   // evictions we see.
