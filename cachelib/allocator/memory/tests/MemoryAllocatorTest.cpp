@@ -494,6 +494,31 @@ TEST_F(MemoryAllocatorTest, GrowShrinkPool) {
   ASSERT_TRUE(m.growPool(p1, Slab::kSize));
 }
 
+// prefetch() takes pointers that may be stale: their slab may since have been
+// released or given to an allocation class of another size. Unlike
+// unCompress(), it must not check them; in debug builds unCompress() and
+// memoryAtOffset() reject these pointers.
+TEST_F(MemoryAllocatorTest, PrefetchStale) {
+  const size_t totalSize = 5 * Slab::kSize;
+  void* memory = allocate(totalSize);
+  const std::set<uint32_t> sizes{1024};
+  MemoryAllocator m(getDefaultMemoryAllocatorConfig(sizes), memory, totalSize);
+  const auto pid = m.addPool("pool", 2 * Slab::kSize, sizes);
+  void* alloc = m.allocate(pid, 1024);
+  ASSERT_NE(nullptr, alloc);
+
+  // One slab holds 1024-byte allocations and the other is not carved yet.
+  const uint32_t pastSlabEnd = Slab::kSize / 1024;
+  for (const uint32_t slabIdx : {0u, 1u}) {
+    for (const uint32_t allocIdx : {1u, pastSlabEnd}) {
+      const CompressedPtr4B ptr{static_cast<int64_t>(
+          compress(CompressedPtr4B{}, slabIdx, allocIdx, false))};
+      m.prefetch(ptr, false /* isMultiTiered */);
+    }
+  }
+  m.free(alloc);
+}
+
 TEST_F(MemoryAllocatorTest, isAllocFreed) {
   const size_t numSlabs = 100;
   const size_t size = numSlabs * Slab::kSize;

@@ -309,6 +309,29 @@ class SlabAllocator {
     return slab->memoryAtOffset(offset);
   }
 
+  // Prefetches the memory of a compressed pointer that may be stale: its slab
+  // may have been released or given to another allocation class since. Unlike
+  // unCompress(), never checks the pointer; out-of-slab offsets are skipped.
+  template <typename CompressedPtrType>
+  void prefetch(const CompressedPtrType& ptr,
+                bool isMultiTiered) const noexcept {
+    if (ptr.isNull()) {
+      return;
+    }
+    const SlabIdx slabIndex = ptr.getSlabIdx(isMultiTiered);
+    uint32_t allocSize;
+    {
+      // allocSize may be 0 or belong to another class; the offset check below
+      // keeps the address inside the slab.
+      folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
+      allocSize = getSlabHeader(slabIndex)->getAllocSize();
+    }
+    const uint64_t offset = uint64_t{allocSize} * ptr.getAllocIdx();
+    if (offset < Slab::kSize) {
+      __builtin_prefetch(slabMemoryStart_[slabIndex].memoryAtOffset(offset));
+    }
+  }
+
   // a special implementation of pointer compression for benchmarking purposes.
   CompressedPtr4B compressAlt(const void* ptr) const;
   void* unCompressAlt(const CompressedPtr4B ptr) const;

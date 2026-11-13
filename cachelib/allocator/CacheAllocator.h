@@ -590,6 +590,22 @@ class CacheAllocator : public CacheBase {
   //                  key does not exist.
   ReadHandle find(Key key);
 
+  // Looks up several keys at once: handles[i] gets what find(keys[i]) would
+  // return, but the DRAM hash table and item cache misses of different keys
+  // overlap. As with find(), keys missing or expired in DRAM are then looked
+  // up in NVM, and those handles may not be ready yet. Stats and the clock are
+  // updated once per batch. The keys must stay valid during the call, so they
+  // must not point into items held only by the handles being overwritten.
+  //
+  // @param keys     the keys to look up
+  // @param handles  output, the same size as keys; overwritten
+  //
+  // @throw std::invalid_argument if the sizes differ
+  // @throw std::overflow_error if the maximum item refcount is exceeded by
+  //        creating a handle; the handles must then be discarded
+  void findMany(folly::Range<const Key*> keys,
+                folly::Range<ReadHandle*> handles);
+
   // Warning: this API is synchronous today with HybridCache. This means as
   //          opposed to find(), we will block on an item being read from
   //          flash until it is loaded into DRAM-cache. In find(), if an item
@@ -5073,6 +5089,63 @@ template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ReadHandle
 CacheAllocator<CacheTrait>::find(typename Item::Key key) {
   return findImpl(key, AccessMode::kRead);
+}
+
+template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::findMany(folly::Range<const Key*> keys,
+                                          folly::Range<ReadHandle*> handles) {
+  if (keys.size() != handles.size()) {
+    throw std::invalid_argument(fmt::format("findMany: {} keys but {} handles",
+                                            keys.size(), handles.size()));
+  }
+
+  stats_.numCacheGets.add(keys.size());
+  accessContainer_->findMany(keys, handles);
+
+  // The per-key logic of findInternalWithExpiration(), but the counters and
+  // the clock are updated once per batch.
+  const uint32_t now = util::getCurrentTimeSec();
+  uint64_t misses = 0;
+  uint64_t expiries = 0;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto& handle = handles[i];
+    auto* const item = handle.getInternal();
+    if (UNLIKELY(!item)) {
+      ++misses;
+      recordEvent(AllocatorApiEvent::FIND, keys[i],
+                  AllocatorApiResult::NOT_FOUND);
+      if (nvmCache_) {
+        handle = nvmCache_->find(HashedKey{keys[i]});
+      }
+      continue;
+    }
+    if (UNLIKELY(item->isExpired(now))) {
+      ++misses;
+      ++expiries;
+      recordEvent(AllocatorApiEvent::FIND, keys[i], AllocatorApiResult::EXPIRED,
+                  handle);
+      handle = {};
+      handle.markExpired();
+      if (nvmCache_) {
+        handle = nvmCache_->find(HashedKey{keys[i]});
+      }
+      continue;
+    }
+    recordEvent(AllocatorApiEvent::FIND, keys[i], AllocatorApiResult::FOUND,
+                handle);
+    // Another thread may have accessed the item after the clock was read.
+    const auto lastAccess = item->getLastAccessTime();
+    if (lastAccess > 0) {
+      handle.setTTASecs(now > lastAccess ? now - lastAccess : 0);
+    }
+    markUseful(handle, AccessMode::kRead);
+  }
+  if (misses) {
+    stats_.numCacheGetMiss.add(misses);
+  }
+  if (expiries) {
+    stats_.numCacheGetExpiries.add(expiries);
+  }
 }
 
 template <typename CacheTrait>

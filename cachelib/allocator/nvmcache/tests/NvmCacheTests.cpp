@@ -20,6 +20,7 @@
 
 #include <array>
 #include <climits>
+#include <cstring>
 #include <set>
 #include <thread>
 
@@ -135,6 +136,32 @@ TEST_F(NvmCacheTest, BasicGet) {
 
   ASSERT_TRUE(this->checkKeyExists(key, true /* ramOnly */));
   ASSERT_TRUE(this->checkKeyExists(key, false /* ramOnly */));
+}
+
+TEST_F(NvmCacheTest, FindMany) {
+  auto& cache = this->cache();
+  for (const std::string key : {"dram", "nvm"}) {
+    auto it = cache.allocate(this->poolId(), key, 100);
+    ASSERT_NE(nullptr, it);
+    std::memset(it->getMemory(), key[0], 100);
+    cache.insertOrReplace(it);
+  }
+  ASSERT_TRUE(this->pushToNvmCacheFromRamForTesting("nvm"));
+  this->removeFromRamForTesting("nvm");
+  ASSERT_FALSE(this->checkKeyExists("nvm", true /* ramOnly */));
+
+  std::vector<LruAllocator::Key> keys{"dram", "nvm", "missing"};
+  std::vector<ReadHandle> handles(keys.size());
+  cache.findMany(folly::range(keys), folly::range(handles));
+  for (const auto& handle : handles) {
+    handle.wait();
+  }
+  ASSERT_NE(nullptr, handles[0]);
+  EXPECT_EQ('d', *reinterpret_cast<const char*>(handles[0]->getMemory()));
+  ASSERT_NE(nullptr, handles[1]);
+  EXPECT_EQ(LruAllocator::Key{"nvm"}, handles[1]->getKey());
+  EXPECT_EQ('n', *reinterpret_cast<const char*>(handles[1]->getMemory()));
+  EXPECT_EQ(nullptr, handles[2]);
 }
 
 TEST_F(NvmCacheTest, CouldExistFast) {
