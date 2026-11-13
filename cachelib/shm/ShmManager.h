@@ -49,7 +49,8 @@ class ShmManager {
  public:
   ShmManager(const std::string& dirName,
              bool usePosix,
-             const std::string& hugePageMountDir = "");
+             const std::string& hugePageMountDir = "",
+             const std::string& posixShmDir = "");
 
   ShmManager(const ShmManager&) = delete;
   ShmManager& operator=(const ShmManager&) = delete;
@@ -129,7 +130,8 @@ class ShmManager {
   static void removeByName(const std::string& cacheDir,
                            const std::string& segName,
                            bool posix,
-                           const std::string& hugePageMountDir = "");
+                           const std::string& hugePageMountDir = "",
+                           const std::string& posixShmDir = "");
 
   // Useful for checking whether a segment exists by name associated with a
   // given cacheDir without instanciating. This should be ONLY used in tests.
@@ -140,7 +142,8 @@ class ShmManager {
   // free up and remove all the segments related to the cache directory.
   static void cleanup(const std::string& cacheDir,
                       bool posix,
-                      const std::string& hugePageMountDir = "");
+                      const std::string& hugePageMountDir = "",
+                      const std::string& posixShmDir = "");
 
   // expose a read only instance of the shm for use where we want to peek at a
   // particular segment without owning its lifetime or any guarantees.
@@ -153,6 +156,8 @@ class ShmManager {
   // @param pageSize   page size backing the segment
   // @param hugePageMountDir hugetlbfs mount containing a POSIX huge-page
   //                         segment
+  // @param posixShmDir      directory containing a POSIX normal-page segment;
+  //                         empty means /dev/shm
   //
   // @return a unique_ptr to the shm if one is present with the name.
   static std::unique_ptr<ShmSegment> attachShmReadOnly(
@@ -161,7 +166,8 @@ class ShmManager {
       bool posix,
       void* addr = nullptr,
       const PageSize& pageSize = PageSize(),
-      const std::string& hugePageMountDir = "");
+      const std::string& hugePageMountDir = "",
+      const std::string& posixShmDir = "");
 
  private:
   enum class ShmVal : int8_t { SHM_SYS_V = 1, SHM_POSIX, SHM_INVALID };
@@ -233,6 +239,13 @@ class ShmManager {
   // huge segments of a cache share one mount). Used to locate segments for
   // removal when no ShmSegmentOpts are available. Empty if none use huge pages.
   const std::string hugePageMountDir_{};
+
+  // Directory of normal-page POSIX segments; empty means /dev/shm.
+  const std::string posixShmDir_{};
+
+  const std::string& segmentDir(const ShmSegmentOpts& opts) const {
+    return opts.pageSize.isHugePage() ? hugePageMountDir_ : posixShmDir_;
+  }
 
   // file handle for the metadata file. It remains open throughout the lifetime
   // of the object.

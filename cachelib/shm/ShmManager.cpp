@@ -41,9 +41,16 @@ inline std::string pathName(const std::string& dir, const std::string& file) {
 
 bool removeSegByName(bool posix,
                      const std::string& uniqueName,
-                     const std::string& hugePageMountDir) {
-  return posix ? PosixShmSegment::removeByName(uniqueName, hugePageMountDir)
-               : SysVShmSegment::removeByName(uniqueName);
+                     const std::string& hugePageMountDir,
+                     const std::string& posixShmDir) {
+  if (!posix) {
+    return SysVShmSegment::removeByName(uniqueName);
+  }
+  bool removed = PosixShmSegment::removeByName(uniqueName, hugePageMountDir);
+  if (!posixShmDir.empty()) {
+    removed |= PosixShmSegment::removeByName(uniqueName, posixShmDir);
+  }
+  return removed;
 }
 
 std::string uniqueIdForNameAndDir(const std::string& name,
@@ -54,11 +61,13 @@ std::string uniqueIdForNameAndDir(const std::string& name,
 
 ShmManager::ShmManager(const std::string& dir,
                        bool usePosix,
-                       const std::string& hugePageMountDir)
+                       const std::string& hugePageMountDir,
+                       const std::string& posixShmDir)
     : controlDir_(dir),
       dirHash_(
           std::to_string(XXH3_64bits(controlDir_.data(), controlDir_.size()))),
       hugePageMountDir_(hugePageMountDir),
+      posixShmDir_(posixShmDir),
       usePosix_(usePosix) {
   // check that the directory exists. If it does not exist, create
   // one. If it exists, extract the name to key mapping from the metadata
@@ -171,7 +180,8 @@ bool ShmManager::initFromFile() {
     const auto removeFromMount = [&](const std::string& mount) {
       for (const auto& entry : nameToKey_) {
         try {
-          removeSegByName(usePosix_, uniqueIdForName(entry.first), mount);
+          removeSegByName(usePosix_, uniqueIdForName(entry.first), mount,
+                          posixShmDir_);
         } catch (...) {
           if (!firstError) {
             firstError = std::current_exception();
@@ -256,8 +266,10 @@ typename ShmManager::ShutDownRes ShmManager::shutDown() {
 void ShmManager::removeByName(const std::string& dir,
                               const std::string& name,
                               bool posix,
-                              const std::string& hugePageMountDir) {
-  removeSegByName(posix, uniqueIdForNameAndDir(name, dir), hugePageMountDir);
+                              const std::string& hugePageMountDir,
+                              const std::string& posixShmDir) {
+  removeSegByName(posix, uniqueIdForNameAndDir(name, dir), hugePageMountDir,
+                  posixShmDir);
 }
 
 bool ShmManager::segmentExists(const std::string& cacheDir,
@@ -277,11 +289,12 @@ std::unique_ptr<ShmSegment> ShmManager::attachShmReadOnly(
     bool posix,
     void* addr,
     const PageSize& pageSize,
-    const std::string& hugePageMountDir) {
+    const std::string& hugePageMountDir,
+    const std::string& posixShmDir) {
   ShmSegmentOpts opts{pageSize, true /* read only */};
-  auto shm =
-      std::make_unique<ShmSegment>(ShmAttach, uniqueIdForNameAndDir(name, dir),
-                                   posix, opts, hugePageMountDir);
+  auto shm = std::make_unique<ShmSegment>(
+      ShmAttach, uniqueIdForNameAndDir(name, dir), posix, opts,
+      pageSize.isHugePage() ? hugePageMountDir : posixShmDir);
   if (!shm->mapAddress(addr)) {
     throw std::invalid_argument(fmt::format(
         "Error mapping shm {} under {}, addr: {}", name, dir, addr));
@@ -291,15 +304,17 @@ std::unique_ptr<ShmSegment> ShmManager::attachShmReadOnly(
 
 void ShmManager::cleanup(const std::string& dir,
                          bool posix,
-                         const std::string& hugePageMountDir) {
+                         const std::string& hugePageMountDir,
+                         const std::string& posixShmDir) {
   // instantiate a shm manager and destroy it to clear all the segments
   // associated with the directory.
-  ShmManager s(dir, posix, hugePageMountDir);
+  ShmManager s(dir, posix, hugePageMountDir, posixShmDir);
 }
 
 void ShmManager::removeAllSegments() {
   for (const auto& kv : nameToKey_) {
-    removeSegByName(usePosix_, uniqueIdForName(kv.first), hugePageMountDir_);
+    removeSegByName(usePosix_, uniqueIdForName(kv.first), hugePageMountDir_,
+                    posixShmDir_);
   }
   nameToKey_.clear();
 }
@@ -310,7 +325,8 @@ void ShmManager::removeUnAttachedSegments() {
     const auto name = it->first;
     // check if the segment is attached.
     if (!segments_.contains(name)) { // not attached
-      removeSegByName(usePosix_, uniqueIdForName(name), hugePageMountDir_);
+      removeSegByName(usePosix_, uniqueIdForName(name), hugePageMountDir_,
+                      posixShmDir_);
       it = nameToKey_.erase(it);
     } else {
       ++it;
@@ -334,7 +350,7 @@ ShmAddr ShmManager::createShm(const std::string& shmName,
   try {
     newSeg =
         std::make_unique<ShmSegment>(ShmNew, uniqueIdForName(shmName), size,
-                                     usePosix_, opts, hugePageMountDir_);
+                                     usePosix_, opts, segmentDir(opts));
   } catch (const std::system_error& e) {
     // if segment already exists by this key and we dont know about
     // it(EEXIST), its an invalid state.
@@ -374,7 +390,7 @@ ShmManager::attachNewShm(const std::string& shmName,
   // This means the segment exists and we can try to attach it.
   try {
     auto seg = std::make_unique<ShmSegment>(ShmAttach, uniqueIdForName(shmName),
-                                            usePosix_, opts, hugePageMountDir_);
+                                            usePosix_, opts, segmentDir(opts));
     auto [it, _] = segments_.emplace(shmName, std::move(seg));
     return it;
   } catch (const std::system_error& e) {
@@ -419,8 +435,8 @@ bool ShmManager::removeShm(const std::string& shmName) {
     DCHECK(shm.isInvalid());
   } catch (const std::invalid_argument&) {
     // shm by this name is not attached.
-    if (!removeSegByName(usePosix_, uniqueIdForName(shmName),
-                         hugePageMountDir_)) {
+    if (!removeSegByName(usePosix_, uniqueIdForName(shmName), hugePageMountDir_,
+                         posixShmDir_)) {
       DCHECK(!segments_.contains(shmName));
       DCHECK(!nameToKey_.contains(shmName));
       return false;

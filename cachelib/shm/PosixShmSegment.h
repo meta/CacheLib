@@ -49,8 +49,8 @@ class PosixShmSegment : public ShmBase {
   //
   // @param name  Name of the segment
   // @param opts  the options for attaching to the segment.
-  // @param hugePageMountDir  hugetlbfs mount backing the segment when it uses
-  //        huge pages; empty for normal (tmpfs) segments.
+  // @param hugePageMountDir  directory of the segment: the hugetlbfs mount for
+  //        huge pages; for normal pages "" means /dev/shm.
   PosixShmSegment(ShmAttachT,
                   const std::string& name,
                   ShmSegmentOpts opts = {},
@@ -60,8 +60,8 @@ class PosixShmSegment : public ShmBase {
   // @param name  The name of the segment
   // @param size  The size of the segment. This will be rounded up to the
   //              nearest page size.
-  // @param hugePageMountDir  hugetlbfs mount to back the segment on when it
-  //        uses huge pages; empty for normal (tmpfs) segments.
+  // @param hugePageMountDir  directory of the segment: the hugetlbfs mount for
+  //        huge pages; for normal pages "" means /dev/shm.
   PosixShmSegment(ShmNewT,
                   const std::string& name,
                   size_t size,
@@ -98,8 +98,8 @@ class PosixShmSegment : public ShmBase {
 
   // useful for removing without attaching
   // @param name  Name of the segment
-  // @param hugePageMountDir  hugetlbfs mount backing the segment if it uses
-  //        huge pages; empty for normal (tmpfs) segments.
+  // @param hugePageMountDir  directory to remove the segment from in addition
+  //        to /dev/shm, if not empty.
   // @return true if the segment existed. false otherwise
   static bool removeByName(const std::string& name,
                            const std::string& hugePageMountDir = "");
@@ -126,8 +126,8 @@ class PosixShmSegment : public ShmBase {
 
   void memBind(void* addr) const;
 
-  // hugetlbfs mount backing this segment when it uses huge pages ("" for
-  // normal/tmpfs segments). Needed to locate the file for removal.
+  // Directory of the segment file ("" for /dev/shm). Needed to locate the
+  // file for removal.
   const std::string hugePageMountDir_;
 
   // file descriptor associated with the shm. This has FD_CLOEXEC set

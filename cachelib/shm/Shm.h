@@ -47,8 +47,8 @@ class ShmSegment {
   // @param name   name of the segment
   // @param size   size of the segment.
   // @param opts   the options for the segment.
-  // @param hugePageMountDir  hugetlbfs mount for a huge-page POSIX segment;
-  //        ignored for SysV and normal-page segments.
+  // @param hugePageMountDir  directory of a POSIX segment: the hugetlbfs mount
+  //        for huge pages; for normal pages "" means /dev/shm. Unused by SysV.
   ShmSegment(ShmNewT,
              std::string name,
              size_t size,
@@ -67,8 +67,8 @@ class ShmSegment {
   // attach to an existing segment with the given key
   // @param name   name of the segment
   // @param opts   the options for the segment.
-  // @param hugePageMountDir  hugetlbfs mount for a huge-page POSIX segment;
-  //        ignored for SysV and normal-page segments.
+  // @param hugePageMountDir  directory of a POSIX segment: the hugetlbfs mount
+  //        for huge pages; for normal pages "" means /dev/shm. Unused by SysV.
   ShmSegment(ShmAttachT,
              std::string name,
              bool usePosix,
