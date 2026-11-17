@@ -139,6 +139,10 @@ class MemoryMonitor : public PeriodicWorker {
     // advised slabs. Warm attach does not reclaim slabs until that call.
     std::set<PoolId> poolIds{};
 
+    // Use observed advised slabs for low-pressure recovery, including when
+    // all monitored pools are empty. The legacy recovery path is the default.
+    bool enableEmptyPoolRecovery{false};
+
     bool disabled() const { return mode == Mode::Disabled; }
   };
 
@@ -286,6 +290,8 @@ class MemoryMonitor : public PeriodicWorker {
   // reclaim slabs to increase cache size and reduce free memory/increase RSS
   void reclaimSlabs();
 
+  void reclaimObservedSlabs(size_t slabsToReclaim, size_t numAdvised);
+
   // cache's interface for rebalancing
   CacheBase& cache_;
 
@@ -302,6 +308,8 @@ class MemoryMonitor : public PeriodicWorker {
 
   // Pools selected by Config::poolIds. Empty means all regular pools.
   const std::set<PoolId> poolIds_;
+  const bool enableEmptyPoolRecovery_;
+  size_t nextRecoveryPool_{0};
 
   // Number of slabs to advise away. This is target number of slabs to be
   // advised across all monitored pools. Note that this needs to be std::atomic

@@ -99,6 +99,11 @@ mod ffi {
             upperLimit: u32,
             adviseStrategy: SharedPtr<RebalanceStrategy>,
         ) -> Result<()>;
+        fn set_memory_monitor_empty_pool_recovery(
+            config: Pin<&mut LruAllocatorConfig>,
+            enabled: bool,
+        ) -> Result<()>;
+        fn get_memory_monitor_empty_pool_recovery(config: &LruAllocatorConfig) -> bool;
 
         fn enable_pool_rebalancing(
             config: Pin<&mut LruAllocatorConfig>,

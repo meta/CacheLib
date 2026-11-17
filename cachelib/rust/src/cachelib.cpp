@@ -104,6 +104,13 @@ void enable_resident_memory_monitor(
   memConfig.maxAdvisePercent = maxAdvisePercentage;
   config.enableMemoryMonitor(interval, memConfig, adviseStrategy);
 }
+void set_memory_monitor_empty_pool_recovery(LruAllocatorConfig& config,
+                                            bool enabled) {
+  config.memMonitorConfig.enableEmptyPoolRecovery = enabled;
+}
+bool get_memory_monitor_empty_pool_recovery(const LruAllocatorConfig& config) {
+  return config.memMonitorConfig.enableEmptyPoolRecovery;
+}
 void enable_pool_rebalancing(
     LruAllocatorConfig& config,
     std::shared_ptr<facebook::cachelib::RebalanceStrategy> strategy,

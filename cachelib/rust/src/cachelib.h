@@ -70,6 +70,10 @@ void enable_resident_memory_monitor(
     uint32_t upperLimit,
     std::shared_ptr<facebook::cachelib::RebalanceStrategy> adviseStrategy);
 
+void set_memory_monitor_empty_pool_recovery(LruAllocatorConfig& config,
+                                            bool enabled);
+bool get_memory_monitor_empty_pool_recovery(const LruAllocatorConfig& config);
+
 void enable_pool_rebalancing(
     LruAllocatorConfig& config,
     std::shared_ptr<facebook::cachelib::RebalanceStrategy> strategy,

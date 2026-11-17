@@ -23,6 +23,7 @@ use std::marker::PhantomData;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::slice;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -176,6 +177,7 @@ pub struct NvmCacheConfig {
 pub struct LruCacheConfig {
     size: usize,
     shrinker: ShrinkerType,
+    empty_pool_recovery: bool,
     cache_name: Option<String>,
     pool_rebalance: Option<PoolRebalanceConfig>,
     pool_resize: Option<PoolResizeConfig>,
@@ -191,6 +193,7 @@ impl LruCacheConfig {
         Self {
             size,
             shrinker: ShrinkerType::NoShrinker,
+            empty_pool_recovery: false,
             cache_name: None,
             pool_rebalance: None,
             pool_resize: None,
@@ -217,6 +220,14 @@ impl LruCacheConfig {
     /// Enable automatic shrinking with the chosen `ShrinkMonitor` settings
     pub fn set_shrinker(mut self, shrinker: ShrinkMonitor) -> Self {
         self.shrinker = ShrinkerType::Config(shrinker);
+        self
+    }
+
+    /// Let the shrinker from `set_shrinker` grow back pools it has emptied: under low memory
+    /// pressure it reclaims the slabs it actually advised away, even when every monitored pool
+    /// is empty. Off by default. It has no effect on the container shrinker or without a shrinker.
+    pub fn set_empty_pool_recovery(mut self, enabled: bool) -> Self {
+        self.empty_pool_recovery = enabled;
         self
     }
 
@@ -279,6 +290,62 @@ impl LruCacheConfig {
     }
 }
 
+fn configure_shrinker(
+    mut cache_config: Pin<&mut ffi::LruAllocatorConfig>,
+    shrinker: ShrinkerType,
+    empty_pool_recovery: bool,
+) -> Result<()> {
+    match shrinker {
+        ShrinkerType::NoShrinker => {}
+        ShrinkerType::Container => {
+            if !ffi::enable_container_memory_monitor(cache_config)? {
+                return Err(ErrorKind::NotInContainer.into());
+            }
+        }
+        ShrinkerType::Config(shrinker) => {
+            let rebalancer = shrinker.strategy.get_strategy()?;
+            match shrinker.shrinker_type {
+                ShrinkMonitorType::FreeMemory {
+                    max_free_mem_gib,
+                    min_free_mem_gib,
+                } => {
+                    ffi::enable_free_memory_monitor(
+                        cache_config.as_mut(),
+                        shrinker.interval.into(),
+                        shrinker.max_resize_per_iteration_percent,
+                        shrinker.max_removed_percent,
+                        min_free_mem_gib,
+                        max_free_mem_gib,
+                        rebalancer,
+                    )?;
+                }
+                ShrinkMonitorType::ResidentSize {
+                    max_process_size_gib,
+                    min_process_size_gib,
+                } => {
+                    ffi::enable_resident_memory_monitor(
+                        cache_config.as_mut(),
+                        shrinker.interval.into(),
+                        shrinker.max_resize_per_iteration_percent,
+                        shrinker.max_removed_percent,
+                        min_process_size_gib,
+                        max_process_size_gib,
+                        rebalancer,
+                    )?;
+                }
+            }
+            ffi::set_memory_monitor_empty_pool_recovery(
+                cache_config.as_mut(),
+                empty_pool_recovery,
+            )?;
+            if empty_pool_recovery {
+                debug_assert!(ffi::get_memory_monitor_empty_pool_recovery(&cache_config));
+            }
+        }
+    };
+    Ok(())
+}
+
 static GLOBAL_CACHE: OnceLock<LruCache> = OnceLock::new();
 
 struct LruCache {
@@ -303,47 +370,11 @@ impl LruCache {
 
         cache_config.pin_mut().setCacheSize(config.size);
 
-        match config.shrinker {
-            ShrinkerType::NoShrinker => {}
-            ShrinkerType::Container => {
-                if !ffi::enable_container_memory_monitor(cache_config.pin_mut())? {
-                    return Err(ErrorKind::NotInContainer.into());
-                }
-            }
-            ShrinkerType::Config(shrinker) => {
-                let rebalancer = shrinker.strategy.get_strategy()?;
-                match shrinker.shrinker_type {
-                    ShrinkMonitorType::FreeMemory {
-                        max_free_mem_gib,
-                        min_free_mem_gib,
-                    } => {
-                        ffi::enable_free_memory_monitor(
-                            cache_config.pin_mut(),
-                            shrinker.interval.into(),
-                            shrinker.max_resize_per_iteration_percent,
-                            shrinker.max_removed_percent,
-                            min_free_mem_gib,
-                            max_free_mem_gib,
-                            rebalancer,
-                        )?;
-                    }
-                    ShrinkMonitorType::ResidentSize {
-                        max_process_size_gib,
-                        min_process_size_gib,
-                    } => {
-                        ffi::enable_resident_memory_monitor(
-                            cache_config.pin_mut(),
-                            shrinker.interval.into(),
-                            shrinker.max_resize_per_iteration_percent,
-                            shrinker.max_removed_percent,
-                            min_process_size_gib,
-                            max_process_size_gib,
-                            rebalancer,
-                        )?;
-                    }
-                }
-            }
-        };
+        configure_shrinker(
+            cache_config.pin_mut(),
+            config.shrinker,
+            config.empty_pool_recovery,
+        )?;
 
         if let Some(pool_rebalance) = config.pool_rebalance {
             let rebalancer = pool_rebalance.strategy.get_strategy()?;
@@ -1238,6 +1269,9 @@ impl VolatileLruCachePool {
         self.inner.transfer_capacity_to(&dest.inner, bytes)
     }
 }
+
+#[cfg(test)]
+mod empty_pool_recovery_tests;
 
 #[cfg(test)]
 mod test {

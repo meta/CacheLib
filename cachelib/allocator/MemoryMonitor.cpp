@@ -17,9 +17,11 @@
 #include "cachelib/allocator/MemoryMonitor.h"
 
 #include <fmt/core.h>
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 
 #include <algorithm>
+#include <vector>
 
 #include "cachelib/allocator/PoolResizeStrategy.h"
 #include "cachelib/common/Exceptions.h"
@@ -36,6 +38,7 @@ MemoryMonitor::MemoryMonitor(CacheBase& cache,
       mode_(config.mode),
       strategy_(std::move(strategy)),
       poolIds_(config.poolIds),
+      enableEmptyPoolRecovery_(config.enableEmptyPoolRecovery),
       numSlabsToAdvise_(initialNumSlabsToAdvise),
       percentAdvisePerIteration_(config.maxAdvisePercentPerIter),
       percentReclaimPerIteration_(config.maxReclaimPercentPerIter),
@@ -115,12 +118,16 @@ void MemoryMonitor::checkFreeMemory() {
           memFree,
           lowerLimit_);
     adviseAwaySlabs();
-  } else if (memFree > upperLimit_ && getMonitoredSlabsAdvised() > 0) {
+  } else if (memFree > upperLimit_ &&
+             (enableEmptyPoolRecovery_ || getMonitoredSlabsAdvised() > 0)) {
     XLOGF(DBG,
           "Free memory size of {} bytes is above the limit of {} bytes",
           memFree,
           upperLimit_);
     reclaimSlabs();
+    if (enableEmptyPoolRecovery_) {
+      return;
+    }
   }
   checkPoolsAndAdviseReclaim();
 }
@@ -128,6 +135,9 @@ void MemoryMonitor::checkFreeMemory() {
 void MemoryMonitor::checkResidentMemory() {
   auto rss = util::getRSSBytes();
   memRssSize_ = rss;
+  if (enableEmptyPoolRecovery_ && rss == 0) {
+    return;
+  }
   rateLimiter_.addValue(rss);
   if (rss > upperLimit_) {
     XLOGF(DBG,
@@ -135,12 +145,16 @@ void MemoryMonitor::checkResidentMemory() {
           rss,
           upperLimit_);
     adviseAwaySlabs();
-  } else if (rss < lowerLimit_ && getMonitoredSlabsAdvised() > 0) {
+  } else if (rss < lowerLimit_ &&
+             (enableEmptyPoolRecovery_ || getMonitoredSlabsAdvised() > 0)) {
     XLOGF(DBG,
           "Resident memory size of {} bytes is below the limit of {} bytes",
           rss,
           lowerLimit_);
     reclaimSlabs();
+    if (enableEmptyPoolRecovery_) {
+      return;
+    }
   }
   checkPoolsAndAdviseReclaim();
 }
@@ -338,6 +352,10 @@ void MemoryMonitor::reclaimSlabs() {
   if (slabsToReclaim > numAdvised) {
     slabsToReclaim = numAdvised;
   }
+  if (enableEmptyPoolRecovery_) {
+    reclaimObservedSlabs(slabsToReclaim, numAdvised);
+    return;
+  }
   if (slabsToReclaim == 0) {
     return;
   }
@@ -350,6 +368,68 @@ void MemoryMonitor::reclaimSlabs() {
   XLOGF(DBG, "Reclaiming {} slabs to increase cache size by {} bytes",
         slabsToReclaim, slabsToReclaim * Slab::kSize);
   updateNumSlabsToAdvise(-static_cast<int32_t>(slabsToReclaim));
+}
+
+void MemoryMonitor::reclaimObservedSlabs(size_t slabsToReclaim,
+                                         size_t numAdvised) {
+  const auto poolIds = getMonitoredPoolIds();
+  // A retry needs a fresh low-pressure decision and rate-limit allowance, not
+  // outstanding target debt that could run in the deadband or under pressure.
+  SCOPE_EXIT {
+    numSlabsToAdvise_.store(cache_.getNumSlabsAdvised(poolIds),
+                            std::memory_order_release);
+  };
+  if (slabsToReclaim == 0) {
+    return;
+  }
+
+  if (getSlabsInUse() != 0) {
+    const auto results = cache_.calcNumSlabsToAdviseReclaim(
+        numAdvised - slabsToReclaim, poolIds);
+    if (results.advise) {
+      return;
+    }
+    for (const auto& [poolId, count] : results.poolAdviseReclaimMap) {
+      if (slabsToReclaim == 0) {
+        break;
+      }
+      const auto requested = std::min<size_t>(count, slabsToReclaim);
+      const auto reclaimed = cache_.reclaimSlabs(poolId, requested);
+      XDCHECK_LE(reclaimed, requested);
+      slabsToReclaim -= reclaimed;
+    }
+    return;
+  }
+
+  // In-use weights are undefined for an empty cache. Give every advised pool
+  // a share, rotating the first pool when the allowance is smaller than the
+  // number of pools.
+  std::vector<std::pair<PoolId, size_t>> pools;
+  for (const auto poolId : poolIds) {
+    const auto advised = cache_.getPool(poolId).getNumSlabsAdvised();
+    if (advised != 0) {
+      pools.emplace_back(poolId, advised);
+    }
+  }
+  const auto first =
+      std::find_if(pools.begin(), pools.end(), [this](auto pool) {
+        return static_cast<size_t>(pool.first) >= nextRecoveryPool_;
+      });
+  std::rotate(pools.begin(), first, pools.end());
+  auto poolsLeft = pools.size();
+  for (const auto& [poolId, advised] : pools) {
+    if (slabsToReclaim == 0) {
+      break;
+    }
+    const auto share =
+        slabsToReclaim / poolsLeft + (slabsToReclaim % poolsLeft != 0);
+    --poolsLeft;
+    const auto requested = std::min(advised, share);
+    const auto reclaimed = cache_.reclaimSlabs(poolId, requested);
+    XDCHECK_LE(reclaimed, requested);
+    slabsToReclaim -= reclaimed;
+    nextRecoveryPool_ = static_cast<size_t>(poolId) + 1;
+  }
 }
 
 RateLimiter::RateLimiter(bool detectIncrease)
