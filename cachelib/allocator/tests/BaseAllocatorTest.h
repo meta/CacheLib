@@ -841,7 +841,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
         const auto key = this->getRandomNewKey(alloc, keyLen);
         auto handle = util::allocateAccessible(alloc, poolId, key, size);
         ASSERT_NE(handle, nullptr);
-        ASSERT_EQ(handle->getKey(), key);
+        ASSERT_EQ(handle->getKey().str(), key);
         keysCreated.insert(key);
       }
     } while (evictedKeys.size() == numEvictions);
@@ -854,7 +854,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       } else {
         auto handle = alloc.find(key);
         ASSERT_NE(handle, nullptr);
-        ASSERT_EQ(handle->getKey(), key);
+        ASSERT_EQ(handle->getKey().str(), key);
       }
     }
   }
@@ -891,7 +891,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
         const auto key = this->getRandomNewKey(alloc, keyLen);
         auto handle = util::allocateAccessible(alloc, poolId, key, size);
         ASSERT_NE(handle, nullptr);
-        ASSERT_EQ(handle->getKey(), key);
+        ASSERT_EQ(handle->getKey().str(), key);
         keysCreated.insert(key);
       }
     } while (evictedKeys.size() == numEvictions);

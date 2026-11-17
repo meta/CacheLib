@@ -603,7 +603,7 @@ void AccessTypeTest<AccessType>::testIteratorMayContainNull() {
                 if (!node) {
                   return nullptr;
                 }
-                if (node->getKey() == keyToReturnNull) {
+                if (node->getKey() == typename Node::Key{keyToReturnNull}) {
                   return nullptr;
                 }
                 node->incRef();
