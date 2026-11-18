@@ -16,8 +16,11 @@
 
 #include <folly/Conv.h>
 #include <folly/FileUtil.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/testing/TestUtil.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <cstdlib>
 
@@ -56,6 +59,18 @@ void ShmTest::testPageSize(size_t p, bool posix) {
     ASSERT_EQ(ps.getPageSize(),
               ps.getPageSizeInSMap(s2.getCurrentMapping().addr));
   });
+}
+
+TEST(PageSize, MappingWithColonInPath) {
+  folly::test::TemporaryFile file("cachelib:page-size");
+  const size_t size = PageSize::systemPageSize();
+  ASSERT_EQ(0, ftruncate(file.fd(), size));
+  void* addr =
+      mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, file.fd(), 0);
+  ASSERT_NE(MAP_FAILED, addr);
+  SCOPE_EXIT { munmap(addr, size); };
+
+  EXPECT_EQ(size, PageSize::getPageSizeInSMap(addr));
 }
 
 TEST_F(ShmTestPosix, HugePageRequiresMount) {

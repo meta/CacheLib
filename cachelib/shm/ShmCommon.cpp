@@ -166,7 +166,7 @@ bool isAddressLine(folly::StringPiece line) {
   // address lines contain lots of fields before the first :
   // 006de000-01397000 rw-p 00000000 00:00 0                          [heap]
   folly::StringPiece first, second;
-  folly::split(':', line, first, second);
+  folly::split<false>(':', line, first, second);
   return first.find(' ') != std::string::npos;
 }
 } // namespace
