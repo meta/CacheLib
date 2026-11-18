@@ -276,7 +276,7 @@ TEST_F(TransferExecutorTest, TransfersItem) {
 
   auto found = ASSERT_OK(folly::coro::blockingWait(destination_->find("key")));
   ASSERT_TRUE(found.has_value());
-  EXPECT_EQ(found->key(), "key");
+  EXPECT_EQ(found->key().str(), "key");
   EXPECT_EQ(valueOf(*found), "value");
   EXPECT_EQ(found->creationTime(), 100);
   EXPECT_EQ(found->expiryTime(), 0);

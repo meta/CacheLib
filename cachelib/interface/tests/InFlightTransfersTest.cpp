@@ -15,18 +15,22 @@
  */
 
 #include <folly/CancellationToken.h>
+#include <folly/coro/Collect.h>
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/WithCancellation.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/ManualExecutor.h>
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <future>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "cachelib/interface/InFlightTransfers.h"
 
@@ -282,4 +286,310 @@ TEST(InFlightTransfersTest, CallerCancellationDoesNotAbandonCompletionWait) {
   executor.drain();
   ASSERT_TRUE(wait.isReady());
   std::move(wait).get();
+}
+
+TEST(InFlightTransfersTest, OperationWaitsForTransferAndBlocksNewTransfers) {
+  for (auto policy : {InFlightTransfers::TransferPolicy::Wait,
+                      InFlightTransfers::TransferPolicy::CancelAndWait}) {
+    SCOPED_TRACE(static_cast<int>(policy));
+    folly::ManualExecutor executor;
+    InFlightTransfers transfers;
+    auto transfer = transfers.tryAcquireTransferToken("key");
+    ASSERT_TRUE(transfer);
+    auto mutation = folly::coro::co_withExecutor(
+                        &executor, transfers.lockForOperation("key", policy))
+                        .start();
+    executor.drain();
+    EXPECT_EQ(transfer->getCancellationToken().isCancellationRequested(),
+              policy == InFlightTransfers::TransferPolicy::CancelAndWait);
+    EXPECT_FALSE(mutation.isReady());
+    EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+    EXPECT_TRUE(transfers.tryAcquireTransferToken("other"));
+    transfer.reset();
+    executor.drain();
+    ASSERT_TRUE(mutation.isReady());
+    EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+    auto guard = std::move(mutation).get();
+    EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+    guard = {};
+    EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+  }
+}
+
+TEST(InFlightTransfersTest, QueuedOperationsWithDifferentPoliciesRunInOrder) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  auto cancellation = transfer->getCancellationToken();
+  auto first = folly::coro::co_withExecutor(
+                   &executor,
+                   transfers.lockForOperation(
+                       "key", InFlightTransfers::TransferPolicy::Wait))
+                   .start();
+  executor.drain();
+  EXPECT_FALSE(transfer->getCancellationToken().isCancellationRequested());
+  auto second =
+      folly::coro::co_withExecutor(
+          &executor,
+          transfers.lockForOperation(
+              "key", InFlightTransfers::TransferPolicy::CancelAndWait))
+          .start();
+  executor.drain();
+  EXPECT_FALSE(cancellation.isCancellationRequested());
+  EXPECT_FALSE(first.isReady());
+  EXPECT_FALSE(second.isReady());
+  transfer.reset();
+  executor.drain();
+  EXPECT_FALSE(cancellation.canBeCancelled());
+  ASSERT_TRUE(first.isReady());
+  EXPECT_FALSE(second.isReady());
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  auto firstGuard = std::move(first).get();
+  firstGuard = {};
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  executor.drain();
+  ASSERT_TRUE(second.isReady());
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  auto secondGuard = std::move(second).get();
+  secondGuard = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest,
+     CompletionWaitIncludesObservedGuardButNotLaterGuards) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  auto first = folly::coro::co_withExecutor(
+                   &executor,
+                   transfers.lockForOperation(
+                       "key", InFlightTransfers::TransferPolicy::Wait))
+                   .start();
+  executor.drain();
+  transfers.cancel("key");
+  EXPECT_FALSE(transfer->getCancellationToken().isCancellationRequested());
+  auto completion =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("key"))
+          .start();
+  executor.drain();
+  EXPECT_FALSE(transfer->getCancellationToken().isCancellationRequested());
+  EXPECT_FALSE(completion.isReady());
+  auto second =
+      folly::coro::co_withExecutor(
+          &executor,
+          transfers.lockForOperation(
+              "key", InFlightTransfers::TransferPolicy::CancelAndWait))
+          .start();
+  executor.drain();
+  EXPECT_FALSE(transfer->getCancellationToken().isCancellationRequested());
+  transfer.reset();
+  executor.drain();
+  ASSERT_TRUE(first.isReady());
+  EXPECT_FALSE(completion.isReady());
+  EXPECT_FALSE(second.isReady());
+  auto firstGuard = std::move(first).get();
+  firstGuard = {};
+  executor.drain();
+  ASSERT_TRUE(completion.isReady());
+  std::move(completion).get();
+  ASSERT_TRUE(second.isReady());
+  auto secondGuard = std::move(second).get();
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  secondGuard = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest, UnstartedMutationDoesNotCancelOrReserve) {
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  {
+    auto mutation = transfers.lockForOperation(
+        "key", InFlightTransfers::TransferPolicy::CancelAndWait);
+    EXPECT_FALSE(transfer->getCancellationToken().isCancellationRequested());
+    transfer.reset();
+    EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+  }
+}
+
+CO_TEST(InFlightTransfersTest, MovesMutationOwnershipAndReleasesPreviousKey) {
+  InFlightTransfers transfers;
+  auto first = co_await transfers.lockForOperation(
+      "first", InFlightTransfers::TransferPolicy::CancelAndWait);
+  auto second = co_await transfers.lockForOperation(
+      "second", InFlightTransfers::TransferPolicy::CancelAndWait);
+  auto moved = std::move(first);
+  first = {};
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("first"));
+  second = std::move(moved);
+  moved = {};
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("first"));
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("second"));
+  second = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("first"));
+}
+
+TEST(InFlightTransfersTest, MutationTaskAndGuardOutliveRegistryAndKey) {
+  // Exceeds the small-string buffer so ASan reports reads of the freed key.
+  constexpr size_t kHeapKeyLength = 100;
+  folly::ManualExecutor executor;
+  auto transfers = std::make_unique<InFlightTransfers>();
+  auto transfer =
+      transfers->tryAcquireTransferToken(std::string(kHeapKeyLength, 'k'));
+  ASSERT_TRUE(transfer);
+  auto task = transfers->lockForOperation(
+      std::string(kHeapKeyLength, 'k'),
+      InFlightTransfers::TransferPolicy::CancelAndWait);
+  transfers.reset();
+  auto mutation =
+      folly::coro::co_withExecutor(&executor, std::move(task)).start();
+  executor.drain();
+  EXPECT_TRUE(transfer->getCancellationToken().isCancellationRequested());
+  EXPECT_FALSE(mutation.isReady());
+  transfer.reset();
+  executor.drain();
+  ASSERT_TRUE(mutation.isReady());
+  auto guard = std::move(mutation).get();
+  guard = {};
+}
+
+CO_TEST(InFlightTransfersTest,
+        TransferCompletionDoesNotWaitForKeyOperationGuard) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  auto completion =
+      folly::coro::co_withExecutor(&executor, transfers.cancelAndWait("key"))
+          .start();
+  executor.drain();
+  auto mutation =
+      folly::coro::co_withExecutor(
+          &executor,
+          transfers.lockForOperation(
+              "key", InFlightTransfers::TransferPolicy::CancelAndWait))
+          .start();
+  executor.drain();
+  EXPECT_FALSE(mutation.isReady());
+  EXPECT_FALSE(completion.isReady());
+  transfer.reset();
+  executor.drain();
+  CO_ASSERT_TRUE(mutation.isReady());
+  CO_ASSERT_TRUE(completion.isReady());
+  auto guard = std::move(mutation).get();
+  std::move(completion).get();
+  transfers.cancel("key");
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  guard = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest,
+     CallerCancellationDoesNotReleaseMutationReservation) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  folly::CancellationSource callerCancellation;
+  callerCancellation.requestCancellation();
+  auto mutation =
+      folly::coro::co_withExecutor(
+          &executor,
+          folly::coro::co_withCancellation(
+              callerCancellation.getToken(),
+              transfers.lockForOperation(
+                  "key", InFlightTransfers::TransferPolicy::CancelAndWait)))
+          .start();
+  executor.drain();
+  EXPECT_TRUE(transfer->getCancellationToken().isCancellationRequested());
+  EXPECT_FALSE(mutation.isReady());
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  transfer.reset();
+  executor.drain();
+  ASSERT_TRUE(mutation.isReady());
+  auto guard = std::move(mutation).get();
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  guard = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest, MutationReservesBeforeCancellationCallbacksRun) {
+  folly::ManualExecutor executor;
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  ASSERT_TRUE(transfer);
+  folly::CancellationCallback callback{
+      transfer->getCancellationToken(), [&] {
+        transfer.reset();
+        EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+      }};
+  auto mutation =
+      folly::coro::co_withExecutor(
+          &executor,
+          transfers.lockForOperation(
+              "key", InFlightTransfers::TransferPolicy::CancelAndWait))
+          .start();
+  executor.drain();
+  ASSERT_TRUE(mutation.isReady());
+  EXPECT_FALSE(transfer);
+  auto guard = std::move(mutation).get();
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  guard = {};
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+namespace {
+
+struct ExclusionCounters {
+  std::atomic<int> transfers{0};
+  std::atomic<int> mutations{0};
+};
+
+folly::coro::Task<void> runTransfersAndMutations(InFlightTransfers& registry,
+                                                 ExclusionCounters& active,
+                                                 size_t worker,
+                                                 size_t iterations) {
+  for (size_t iteration = 0; iteration < iterations; ++iteration) {
+    registry.cancel("key");
+    if ((worker + iteration) % 2 == 0) {
+      if (auto transfer = registry.tryAcquireTransferToken("key")) {
+        EXPECT_EQ(active.transfers.fetch_add(1), 0);
+        std::this_thread::yield();
+        EXPECT_EQ(active.mutations.load(), 0);
+        active.transfers.fetch_sub(1);
+      }
+    } else {
+      auto guard = co_await registry.lockForOperation(
+          "key", worker % 2 == 0
+                     ? InFlightTransfers::TransferPolicy::Wait
+                     : InFlightTransfers::TransferPolicy::CancelAndWait);
+      EXPECT_EQ(active.mutations.fetch_add(1), 0);
+      std::this_thread::yield();
+      EXPECT_EQ(active.transfers.load(), 0);
+      active.mutations.fetch_sub(1);
+    }
+  }
+}
+
+} // namespace
+
+CO_TEST(InFlightTransfersTest, ConcurrentTransfersAndMutationsNeverOverlap) {
+  constexpr size_t kWorkers = 4;
+  constexpr size_t kIterations = 256;
+  InFlightTransfers transfers;
+  ExclusionCounters active;
+  folly::CPUThreadPoolExecutor executor{kWorkers};
+  std::vector<folly::coro::TaskWithExecutor<void>> workers;
+  workers.reserve(kWorkers);
+  for (size_t worker = 0; worker < kWorkers; ++worker) {
+    workers.push_back(folly::coro::co_withExecutor(
+        &executor,
+        runTransfersAndMutations(transfers, active, worker, kIterations)));
+  }
+  co_await folly::coro::collectAllRange(std::move(workers));
+  EXPECT_EQ(active.transfers.load(), 0);
+  EXPECT_EQ(active.mutations.load(), 0);
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
 }

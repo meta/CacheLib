@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "cachelib/interface/CacheItem.h"
 
@@ -29,32 +30,63 @@ namespace facebook::cachelib::interface {
 /**
  * Registers one transfer per key and provides cooperative cancellation.
  * Callers own execution and retain the transfer token until their work ends.
- * Cancellation does not authorize cache publication or serialize mutations.
+ * A key operation guard waits for the key's transfer and earlier guards,
+ * optionally requests transfer cancellation, and keeps new transfers out
+ * until it is released.
  */
 class InFlightTransfers {
  private:
-  struct Entry;
+  struct Registration;
   struct State;
 
+  struct RegistrationGuard {
+    RegistrationGuard() = default;
+    explicit RegistrationGuard(std::shared_ptr<Registration> node) noexcept;
+    ~RegistrationGuard();
+    RegistrationGuard(const RegistrationGuard&) = delete;
+    RegistrationGuard& operator=(const RegistrationGuard&) = delete;
+    RegistrationGuard(RegistrationGuard&&) noexcept = default;
+    RegistrationGuard& operator=(RegistrationGuard&& other) noexcept;
+
+    std::shared_ptr<Registration> node_;
+  };
+
  public:
+  enum class TransferPolicy { Wait, CancelAndWait };
+
   class TransferToken {
    public:
     TransferToken() = default;
-    ~TransferToken();
+    ~TransferToken() = default;
     TransferToken(const TransferToken&) = delete;
     TransferToken& operator=(const TransferToken&) = delete;
     TransferToken(TransferToken&&) noexcept = default;
-    TransferToken& operator=(TransferToken&& other) noexcept;
+    TransferToken& operator=(TransferToken&&) noexcept = default;
 
     // Retaining a cancellation token does not retain the registration.
     folly::CancellationToken getCancellationToken() const noexcept;
 
    private:
     friend InFlightTransfers;
-    explicit TransferToken(std::shared_ptr<Entry> entry) noexcept;
-    void finish() noexcept;
+    explicit TransferToken(std::shared_ptr<Registration> node) noexcept;
 
-    std::shared_ptr<Entry> entry_;
+    RegistrationGuard registration_;
+  };
+
+  class KeyOperationGuard {
+   public:
+    KeyOperationGuard() = default;
+    ~KeyOperationGuard() = default;
+    KeyOperationGuard(const KeyOperationGuard&) = delete;
+    KeyOperationGuard& operator=(const KeyOperationGuard&) = delete;
+    KeyOperationGuard(KeyOperationGuard&&) noexcept = default;
+    KeyOperationGuard& operator=(KeyOperationGuard&&) noexcept = default;
+
+   private:
+    friend InFlightTransfers;
+    explicit KeyOperationGuard(std::shared_ptr<Registration> node) noexcept;
+
+    RegistrationGuard registration_;
   };
 
   InFlightTransfers();
@@ -64,27 +96,49 @@ class InFlightTransfers {
   InFlightTransfers(InFlightTransfers&&) = delete;
   InFlightTransfers& operator=(InFlightTransfers&&) = delete;
 
-  // Returns nullopt while another transfer owns this key, even if cancelled.
-  // Destroying the owning token releases the registration without cancelling.
-  // Tokens may outlive this registry.
+  // Returns nullopt while a transfer is registered or a key operation guard is
+  // pending or held for this key. Destroying the owning token releases the
+  // registration without cancelling. Tokens may outlive this registry.
   std::optional<TransferToken> tryAcquireTransferToken(Key key);
 
-  // Requests cancellation of the observed transfer, if any. Callbacks may run
-  // inline and re-enter this registry. This does not block new registrations
-  // after the owning token is released.
+  // Requests cancellation only if the current tail is a transfer. Does not
+  // cancel through queued guards or block new registrations. Callbacks may run
+  // inline and re-enter this registry.
   void cancel(Key key);
 
-  // Snapshots the current transfer and requests cancellation immediately.
-  // Await the returned task for owning-token release after execution/cleanup.
-  // The task can outlive this registry and ignores caller cancellation.
-  // It only waits for the observed transfer; once that transfer releases its
-  // registration, tryAcquireTransferToken() can register a new one.
+  // Snapshots the current tail and cancels it only if it is a transfer.
+  // Await for that token/guard's release, including all earlier work. Does not
+  // reserve the key or wait for later registrations. Do not await while holding
+  // work that this tail depends on. Caller cancellation is ignored; the task
+  // may outlive this registry.
   folly::coro::Task<void> cancelAndWait(Key key);
 
+  // When awaited, reserves the key and waits for its transfer and earlier
+  // guards in registration order. New transfers stay blocked until release.
+  // CancelAndWait requests cancellation only when the immediate predecessor
+  // is a transfer; it does not cancel through queued guards. Wait never
+  // cancels.
+  //
+  // Hold Wait through insert's presence check and insertion. Waiting behind a
+  // transfer is conservative: the item already exists, so insert would fail
+  // once the transfer publishes, and callers may fail early instead. Waiting
+  // is required behind a removal or a transfer it cancels. For findToWrite,
+  // find/promote and pin first, then hold CancelAndWait while acquiring the
+  // write handle. Hold CancelAndWait through insertOrReplace/remove. Recheck
+  // component state under the guard.
+  //
+  // Do not await while holding this key's guard or transfer token, or locks
+  // needed by earlier work. Caller cancellation is ignored; the task and guard
+  // may outlive the registry.
+  folly::coro::Task<KeyOperationGuard> lockForOperation(Key key,
+                                                        TransferPolicy policy);
+
  private:
-  std::shared_ptr<Entry> findEntry(Key key) const;
+  std::shared_ptr<Registration> findRegistration(Key key) const;
   static folly::coro::Task<void> waitForCompletion(
-      std::shared_ptr<Entry> entry);
+      std::shared_ptr<Registration> node);
+  static folly::coro::Task<KeyOperationGuard> lockForOperationImpl(
+      std::shared_ptr<State> state, std::string key, TransferPolicy policy);
 
   std::shared_ptr<State> state_;
 };

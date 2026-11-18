@@ -30,101 +30,148 @@ namespace facebook::cachelib::interface {
 struct InFlightTransfers::State {
   folly::ConcurrentHashMapSIMD<
       std::string,
-      std::weak_ptr<Entry>,
+      std::weak_ptr<Registration>,
       folly::transparent<std::hash<std::string_view>>,
       folly::transparent<std::equal_to<std::string_view>>>
-      entries_;
+      tails_;
 };
 
-struct InFlightTransfers::Entry {
-  Entry(std::shared_ptr<State> state, std::string key)
-      : state_(std::move(state)), key_(std::move(key)) {}
-  ~Entry() = default;
-  Entry(const Entry&) = delete;
-  Entry& operator=(const Entry&) = delete;
-  Entry(Entry&&) = delete;
-  Entry& operator=(Entry&&) = delete;
+struct InFlightTransfers::Registration {
+  Registration(std::shared_ptr<State> state,
+               std::string key,
+               folly::CancellationSource cancellation =
+                   folly::CancellationSource::invalid())
+      : state_(std::move(state)),
+        key_(std::move(key)),
+        cancellation_(std::move(cancellation)) {}
+  ~Registration() = default;
+  Registration(const Registration&) = delete;
+  Registration& operator=(const Registration&) = delete;
+  Registration(Registration&&) = delete;
+  Registration& operator=(Registration&&) = delete;
 
   std::shared_ptr<State> state_;
   std::string key_;
+  // Live only for transfers; key operation guards never expose a cancellation
+  // token.
   folly::CancellationSource cancellation_;
   folly::coro::Baton finished_;
+  std::shared_ptr<Registration> next_;
+
+  bool isTransfer() const noexcept { return cancellation_.canBeCancelled(); }
 };
 
 InFlightTransfers::InFlightTransfers() : state_(std::make_shared<State>()) {}
 
-InFlightTransfers::TransferToken::TransferToken(
-    std::shared_ptr<Entry> entry) noexcept
-    : entry_(std::move(entry)) {}
+InFlightTransfers::RegistrationGuard::RegistrationGuard(
+    std::shared_ptr<Registration> node) noexcept
+    : node_(std::move(node)) {}
 
-InFlightTransfers::TransferToken::~TransferToken() { finish(); }
-
-InFlightTransfers::TransferToken& InFlightTransfers::TransferToken::operator=(
-    TransferToken&& other) noexcept {
+InFlightTransfers::RegistrationGuard&
+InFlightTransfers::RegistrationGuard::operator=(
+    RegistrationGuard&& other) noexcept {
   if (this == &other) {
     return *this;
   }
-  TransferToken previous{std::move(*this)};
-  entry_ = std::move(other.entry_);
+  RegistrationGuard previous{std::move(*this)};
+  node_ = std::move(other.node_);
   return *this;
 }
 
-void InFlightTransfers::TransferToken::finish() noexcept {
-  auto entry = std::move(entry_);
-  if (!entry) {
+InFlightTransfers::RegistrationGuard::~RegistrationGuard() {
+  auto node = std::move(node_);
+  if (!node) {
     return;
   }
-  entry->state_->entries_.erase_key_if(
-      entry->key_, [&entry](const auto& current) {
-        return !current.owner_before(entry) && !entry.owner_before(current);
-      });
+  node->state_->tails_.erase_key_if(node->key_, [&node](const auto& current) {
+    return !current.owner_before(node) && !node.owner_before(current);
+  });
   // Keep the baton alive across inline waiter resumption, outside map locks.
-  entry->finished_.post();
+  node->finished_.post();
 }
+
+InFlightTransfers::TransferToken::TransferToken(
+    std::shared_ptr<Registration> node) noexcept
+    : registration_(std::move(node)) {}
+
+InFlightTransfers::KeyOperationGuard::KeyOperationGuard(
+    std::shared_ptr<Registration> node) noexcept
+    : registration_(std::move(node)) {}
 
 folly::CancellationToken
 InFlightTransfers::TransferToken::getCancellationToken() const noexcept {
-  return entry_ ? entry_->cancellation_.getToken() : folly::CancellationToken{};
+  const auto& node = registration_.node_;
+  return node ? node->cancellation_.getToken() : folly::CancellationToken{};
 }
 
 std::optional<InFlightTransfers::TransferToken>
 InFlightTransfers::tryAcquireTransferToken(Key key) {
-  auto entry =
-      std::make_shared<Entry>(state_, std::string{key.data(), key.size()});
-  auto [it, inserted] = state_->entries_.insert_or_assign_if(
-      entry->key_, std::weak_ptr<Entry>{entry},
+  auto node = std::make_shared<Registration>(
+      state_, std::string{key.data(), key.size()}, folly::CancellationSource{});
+  auto [it, inserted] = state_->tails_.insert_or_assign_if(
+      node->key_, std::weak_ptr<Registration>{node},
       [](const auto& current) { return current.expired(); });
   if (!inserted) {
     return std::nullopt;
   }
-  return TransferToken{std::move(entry)};
+  return TransferToken{std::move(node)};
 }
 
-std::shared_ptr<InFlightTransfers::Entry> InFlightTransfers::findEntry(
-    Key key) const {
-  auto it = state_->entries_.find(std::string_view{key.data(), key.size()});
-  return it == state_->entries_.end() ? nullptr : it->second.lock();
+std::shared_ptr<InFlightTransfers::Registration>
+InFlightTransfers::findRegistration(Key key) const {
+  auto it = state_->tails_.find(std::string_view{key.data(), key.size()});
+  if (it != state_->tails_.end()) {
+    return it->second.lock();
+  }
+  return nullptr;
 }
 
 void InFlightTransfers::cancel(Key key) {
-  if (auto entry = findEntry(key)) {
-    entry->cancellation_.requestCancellation();
+  if (auto node = findRegistration(key); node && node->isTransfer()) {
+    node->cancellation_.requestCancellation();
   }
 }
 
 folly::coro::Task<void> InFlightTransfers::cancelAndWait(Key key) {
-  auto entry = findEntry(key);
-  if (entry) {
-    entry->cancellation_.requestCancellation();
+  auto node = findRegistration(key);
+  if (node && node->isTransfer()) {
+    node->cancellation_.requestCancellation();
   }
-  return waitForCompletion(std::move(entry));
+  return waitForCompletion(std::move(node));
 }
 
 folly::coro::Task<void> InFlightTransfers::waitForCompletion(
-    std::shared_ptr<Entry> entry) {
-  if (entry) {
-    co_await entry->finished_;
+    std::shared_ptr<Registration> node) {
+  if (node) {
+    co_await node->finished_;
   }
+}
+
+folly::coro::Task<InFlightTransfers::KeyOperationGuard>
+InFlightTransfers::lockForOperation(Key key, TransferPolicy policy) {
+  return lockForOperationImpl(state_, std::string{key.data(), key.size()},
+                              policy);
+}
+
+folly::coro::Task<InFlightTransfers::KeyOperationGuard>
+InFlightTransfers::lockForOperationImpl(std::shared_ptr<State> state,
+                                        std::string key,
+                                        TransferPolicy policy) {
+  auto node = std::make_shared<Registration>(std::move(state), std::move(key));
+  KeyOperationGuard guard{node};
+  node->state_->tails_.insert_or_assign_if(
+      node->key_, std::weak_ptr<Registration>{node}, [&](const auto& current) {
+        node->next_ = current.lock();
+        return true;
+      });
+  if (const auto& previous = node->next_) {
+    if (policy == TransferPolicy::CancelAndWait && previous->isTransfer()) {
+      previous->cancellation_.requestCancellation();
+    }
+    co_await previous->finished_;
+    node->next_.reset();
+  }
+  co_return std::move(guard);
 }
 
 } // namespace facebook::cachelib::interface
