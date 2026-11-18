@@ -430,6 +430,9 @@ struct GlobalCacheStats {
   // number of evictions where items leave both RAM and NvmCache entirely
   uint64_t numCacheEvictions{0};
 
+  // number of expired items removed from RAM by eviction or the reaper
+  uint64_t numRamExpiredEvict{0};
+
   // number of evictions from nvm that found an inconsistent state in RAM
   uint64_t numNvmUncleanEvict{0};
 

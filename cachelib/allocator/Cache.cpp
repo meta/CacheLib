@@ -274,6 +274,7 @@ void CacheBase::updateGlobalCacheStats(const std::string& statPrefix) const {
   // Ram Evictions: item evicted from ram but it can be inserted into nvm
   const std::string ramEvictionKey = statPrefix + "ram.evictions";
   counters_.updateDelta(ramEvictionKey, stats.numEvictions);
+  counters_.updateDelta(ramEvictionKey + ".expired", stats.numRamExpiredEvict);
   // Nvm Evictions: item evicted from nvm but it can be still in ram
   const std::string nvmEvictionKey = statPrefix + "nvm.evictions";
   counters_.updateDelta(nvmEvictionKey, stats.numNvmEvictions);
