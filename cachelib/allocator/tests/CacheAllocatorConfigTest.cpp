@@ -14,8 +14,14 @@
  * limitations under the License.
  */
 
+#include <folly/testing/TestUtil.h>
+
+#include <cstring>
+#include <filesystem>
+
 #include "cachelib/allocator/CacheAllocatorConfig.h"
 #include "cachelib/allocator/MemoryTierCacheConfig.h"
+#include "cachelib/allocator/ReadOnlySharedCacheView.h"
 #include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/allocator/tests/TestBase.h"
 #include "cachelib/common/EventSink.h"
@@ -120,6 +126,62 @@ TEST_F(CacheAllocatorConfigTest, ConflictingHugePageMountDirsThrow) {
   EXPECT_NO_THROW(config.enableAccessHugePages(huge, "/mnt/hugetlbfs-a"));
   EXPECT_NO_THROW(config.enableAccessHugePages(huge));
   EXPECT_EQ("/mnt/hugetlbfs-a", config.hugePageMountDir);
+}
+
+TEST_F(CacheAllocatorConfigTest, PosixShmDirectory) {
+  AllocatorT::Config config;
+  // Needs cache persistence, as usePosixForShm() does.
+  EXPECT_THROW(config.usePosixShmDirectory("/segments"), std::invalid_argument);
+  config.enableCachePersistence("/cache");
+  EXPECT_THROW(config.usePosixShmDirectory(""), std::invalid_argument);
+
+  config.usePosixShmDirectory("/segments");
+  EXPECT_TRUE(config.isUsingPosixShm());
+  EXPECT_EQ("/segments", config.posixShmDirectory);
+  EXPECT_EQ("/segments", config.serialize()["posixShmDirectory"]);
+}
+
+TEST_F(CacheAllocatorConfigTest, PosixShmDirectoryWarmRoll) {
+  folly::test::TemporaryDirectory cacheDir;
+  folly::test::TemporaryDirectory segmentDir("", "/dev/shm");
+  const std::string segments = segmentDir.path().string();
+  const auto makeConfig = [&](const std::string& directory) {
+    AllocatorT::Config config;
+    config.setCacheSize(64 * Slab::kSize)
+        .enableCachePersistence(cacheDir.path().string())
+        .usePosixShmDirectory(directory);
+    return config;
+  };
+  {
+    AllocatorT cache(AllocatorT::SharedMemNew, makeConfig(segments));
+    const auto pool =
+        cache.addPool("default", cache.getCacheMemoryStats().ramCacheSize);
+    auto handle = cache.allocate(pool, "key", 100);
+    ASSERT_NE(nullptr, handle);
+    std::memset(handle->getMemory(), 'v', 100);
+    cache.insertOrReplace(handle);
+    handle.reset();
+    ASSERT_EQ(AllocatorT::ShutDownStatus::kSuccess, cache.shutDown());
+  }
+  ASSERT_FALSE(std::filesystem::is_empty(segments));
+  {
+    ReadOnlySharedCacheView view(cacheDir.path().string(), true /* posix */,
+                                 nullptr, PageSize(), "", segments);
+    EXPECT_NE(0u, view.getShmMappingAddress());
+  }
+
+  {
+    AllocatorT cache(AllocatorT::SharedMemAttach, makeConfig(segments));
+    auto handle = cache.find("key");
+    ASSERT_NE(nullptr, handle);
+    EXPECT_EQ('v', *reinterpret_cast<const char*>(handle->getMemory()));
+    handle.reset();
+    ASSERT_EQ(AllocatorT::ShutDownStatus::kSuccess, cache.shutDown());
+  }
+
+  EXPECT_TRUE(AllocatorT::cleanupStrayShmSegments(
+      cacheDir.path().string(), true /* posix */, "", segments));
+  EXPECT_TRUE(std::filesystem::is_empty(segments));
 }
 
 TEST_F(CacheAllocatorConfigTest, SerializeEvictionPolicyLru) {

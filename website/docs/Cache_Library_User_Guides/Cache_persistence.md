@@ -131,6 +131,10 @@ Changing the backing type does not cold-roll: `ShmManager` rejects the attach wi
 
 Huge pages are not supported with cross-host cache persistence. They're also not supported with memory monitoring when the *slab* huge page size is bigger than the slab size - for example, you can't punch a slab-sized hole in a 1GB huge page. (The access huge-page size is exempt: hash tables are never `madvise`d away, so access-only huge pages work with memory monitoring regardless of size.)
 
+## Keep POSIX segments in a directory
+
+By default POSIX shared memory segments live in `/dev/shm`. To keep them as files in another directory, for example a tmpfs volume that outlives a container restart, call `usePosixShmDirectory(dir)` instead of `usePosixForShm()`. The directory must exist and should be on tmpfs; a disk filesystem would write the cache back to disk. The directory is not saved with the cache: if it differs from the previous run, `SharedMemAttach` throws as if there were no saved cache, and segment files in a previous custom directory are left for you to delete. Huge-page segments still use their `hugetlbfs` mount. Cross-host persistence does not support this option yet.
+
 ## Drop persistent cache
 
 Sometimes you would like your cache to be not persistent when you restart your process. There are two ways to accomplish this:

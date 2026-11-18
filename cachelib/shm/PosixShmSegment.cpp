@@ -223,11 +223,12 @@ int shmOpenForPageSize(const std::string& name,
                        int flags,
                        const PageSize& pageSize,
                        const std::string& hugePageMountDir) {
-  if (!pageSize.isHugePage()) {
+  if (!pageSize.isHugePage() && hugePageMountDir.empty()) {
     return detail::shmOpenImpl(name.c_str(), flags);
   }
   // HugeTLB segments must use a different mount from /dev/shm (which is
-  // hardcoded by shm_open)
+  // hardcoded by shm_open). Normal-page segments get a directory only from
+  // usePosixShmDirectory().
   if (hugePageMountDir.empty()) {
     util::throwSystemError(
         EINVAL,
