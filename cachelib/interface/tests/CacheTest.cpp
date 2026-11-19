@@ -73,7 +73,7 @@ CO_TYPED_TEST(CacheTest, AllocateInsertFindAndExists) {
   auto result = CO_ASSERT_OK(co_await this->cache_->find(key));
   CO_ASSERT_TRUE(result.has_value());
   auto handle = std::move(result).value();
-  EXPECT_EQ(handle->getKey(), key);
+  EXPECT_EQ(handle->getKey(), Key{key});
   EXPECT_EQ(std::string(static_cast<const char*>(handle->getMemory()),
                         handle->getMemorySize()),
             value);

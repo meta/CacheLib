@@ -163,7 +163,7 @@ CO_TYPED_TEST(FlashCacheComponentTest, ExpirationCallback) {
     auto findResult = CO_ASSERT_OK(co_await this->cache_->find(key));
     CO_ASSERT_TRUE(findResult.has_value());
     auto foundHandle = std::move(findResult.value()).release();
-    EXPECT_EQ(foundHandle->getKey(), key);
+    EXPECT_EQ(foundHandle->getKey(), Key{key});
     EXPECT_EQ(foundHandle->getExpiryTime(),
               foundHandle->getCreationTime() + kTTL);
   }

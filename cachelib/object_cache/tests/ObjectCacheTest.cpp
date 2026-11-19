@@ -494,9 +494,9 @@ class ObjectCacheTest : public ::testing::Test {
     ObjectCacheConfig config;
     config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) {
-          if (data.key == "Foo") {
+          if (data.key == KAllocation::Key{"Foo"}) {
             data.deleteObject<Foo>();
-          } else if (data.key == "Foo2") {
+          } else if (data.key == KAllocation::Key{"Foo2"}) {
             data.deleteObject<Foo2>();
           }
         });
@@ -1416,7 +1416,7 @@ class ObjectCacheTest : public ::testing::Test {
       config.setCacheName("test")
           .setCacheCapacity(10'000 /*l1EntriesLimit*/)
           .setItemDestructor([&](ObjectCacheDestructorData data) {
-            if (data.key == "Foo1") {
+            if (data.key == KAllocation::Key{"Foo1"}) {
               data.deleteObject<ThriftFoo>();
             } else {
               data.deleteObject<ThriftFoo2>();
@@ -1429,14 +1429,14 @@ class ObjectCacheTest : public ::testing::Test {
     config.enablePersistence(
         threadsCount, persistBaseFilePath,
         [&](typename ObjectCache::Serializer serializer) {
-          if (serializer.key == "Foo1") {
+          if (serializer.key == KAllocation::Key{"Foo1"}) {
             return serializer.template serialize<ThriftFoo>();
           } else {
             return serializer.template serialize<ThriftFoo2>();
           }
         },
         [&](typename ObjectCache::Deserializer deserializer) {
-          if (deserializer.key == "Foo1") {
+          if (deserializer.key == KAllocation::Key{"Foo1"}) {
             return deserializer.template deserialize<ThriftFoo>();
           } else {
             return deserializer.template deserialize<ThriftFoo2>();
@@ -1496,14 +1496,14 @@ class ObjectCacheTest : public ::testing::Test {
       newConfig.enablePersistence(
           threadsCount, "random_path",
           [&](typename ObjectCache::Serializer serializer) {
-            if (serializer.key == "Foo1") {
+            if (serializer.key == KAllocation::Key{"Foo1"}) {
               return serializer.template serialize<ThriftFoo>();
             } else {
               return serializer.template serialize<ThriftFoo2>();
             }
           },
           [&](typename ObjectCache::Deserializer deserializer) {
-            if (deserializer.key == "Foo1") {
+            if (deserializer.key == KAllocation::Key{"Foo1"}) {
               return deserializer.template deserialize<ThriftFoo>();
             } else {
               return deserializer.template deserialize<ThriftFoo2>();
@@ -1518,14 +1518,14 @@ class ObjectCacheTest : public ::testing::Test {
       newConfig.enablePersistence(
           threadsCount - 2, persistBaseFilePath,
           [&](typename ObjectCache::Serializer serializer) {
-            if (serializer.key == "Foo1") {
+            if (serializer.key == KAllocation::Key{"Foo1"}) {
               return serializer.template serialize<ThriftFoo>();
             } else {
               return serializer.template serialize<ThriftFoo2>();
             }
           },
           [&](typename ObjectCache::Deserializer deserializer) {
-            if (deserializer.key == "Foo1") {
+            if (deserializer.key == KAllocation::Key{"Foo1"}) {
               return deserializer.template deserialize<ThriftFoo>();
             } else {
               return deserializer.template deserialize<ThriftFoo2>();
@@ -1822,13 +1822,14 @@ class ObjectCacheTest : public ::testing::Test {
               return deserializer.template deserialize<std::string>(
                   [&](folly::StringPiece payload)
                       -> std::unique_ptr<std::string> {
-                    if (deserializer.key == thriftSerErrKey) {
+                    if (deserializer.key == KAllocation::Key{thriftSerErrKey}) {
                       Deserializer deserializer{
                           reinterpret_cast<const uint8_t*>(payload.begin()),
                           reinterpret_cast<const uint8_t*>(payload.end())};
                       return std::make_unique<std::string>(
                           deserializer.deserialize<std::string>());
-                    } else if (deserializer.key == throwExceptionKey) {
+                    } else if (deserializer.key ==
+                               KAllocation::Key{throwExceptionKey}) {
                       throw std::runtime_error("test exception");
                     } else {
                       return std::make_unique<std::string>(payload.str());

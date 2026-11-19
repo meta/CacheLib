@@ -119,7 +119,7 @@ CO_TEST_F(RAMCacheComponentTest, InsertOrReplaceAlwaysReturnsReplacedItem) {
   auto result2 = CO_ASSERT_OK(
       co_await cache_->insertOrReplace(std::move(handle2).release()));
   CO_ASSERT_TRUE(result2.has_value());
-  EXPECT_EQ(result2.value()->getKey(), key);
+  EXPECT_EQ(result2.value()->getKey(), Key{key});
   std::string replacedData(result2.value()->getMemoryAs<const char>(),
                            data1.size());
   EXPECT_EQ(replacedData, data1);
@@ -264,7 +264,7 @@ CO_TEST(RAMCacheComponentEvictionTest, IgnoresExpiredCapacityEviction) {
   auto cache =
       std::make_unique<RAMCacheComponent>(ASSERT_OK(createSmallRAMCache(
           [&expiredItemReported](const CacheItem& item) {
-            if (item.getKey() == "expired") {
+            if (item.getKey() == Key{"expired"}) {
               expiredItemReported = true;
             }
           },
@@ -272,7 +272,7 @@ CO_TEST(RAMCacheComponentEvictionTest, IgnoresExpiredCapacityEviction) {
               const facebook::cachelib::LruAllocator::DestructorData& data) {
             if (data.context ==
                     facebook::cachelib::DestructorContext::kEvictedFromRAM &&
-                data.item.getKey() == "expired") {
+                data.item.getKey() == Key{"expired"}) {
               expiredItemEvicted = true;
             }
           })));

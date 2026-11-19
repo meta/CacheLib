@@ -133,7 +133,7 @@ CO_TYPED_TEST(DescriptorTest, ReadDescriptorPreservesViewAcrossMoves) {
   EXPECT_FALSE(static_cast<bool>(second));
   CO_ASSERT_TRUE(static_cast<bool>(moved));
   EXPECT_TRUE(moved.isHandleBacked());
-  EXPECT_EQ(moved.key(), key);
+  EXPECT_EQ(moved.key(), Key{key});
   EXPECT_EQ(moved.creationTime(), creationTime);
   EXPECT_EQ(moved.expiryTime(), creationTime + kTtlSecs);
   EXPECT_EQ(moved.size(), data.size());
@@ -164,7 +164,7 @@ CO_TYPED_TEST(DescriptorTest, OwnedReadDescriptorOutlivesSourceItem) {
   ReadDescriptor descriptor(std::move(*ownedItem));
   CO_ASSERT_TRUE(static_cast<bool>(descriptor));
   EXPECT_FALSE(descriptor.isHandleBacked());
-  EXPECT_EQ(descriptor.key(), key);
+  EXPECT_EQ(descriptor.key(), Key{key});
   EXPECT_EQ(descriptor.creationTime(), creationTime);
   EXPECT_EQ(descriptor.expiryTime(), creationTime + kTtlSecs);
   EXPECT_EQ(descriptor.size(), data.size());
@@ -176,7 +176,7 @@ CO_TYPED_TEST(DescriptorTest, OwnedReadDescriptorOutlivesSourceItem) {
   // NOLINTNEXTLINE(bugprone-use-after-move)
   EXPECT_FALSE(static_cast<bool>(descriptor));
   CO_ASSERT_TRUE(static_cast<bool>(moved));
-  EXPECT_EQ(moved.key(), key);
+  EXPECT_EQ(moved.key(), Key{key});
   EXPECT_EQ(std::string(static_cast<const char*>(moved.data()), moved.size()),
             data);
 }
@@ -198,7 +198,7 @@ CO_TYPED_TEST(DescriptorTest, OwnedReadDescriptorSupportsEmptyValue) {
   // emptiness of the descriptor are different states.
   CO_ASSERT_TRUE(static_cast<bool>(descriptor));
   EXPECT_FALSE(descriptor.isHandleBacked());
-  EXPECT_EQ(descriptor.key(), key);
+  EXPECT_EQ(descriptor.key(), Key{key});
   EXPECT_EQ(descriptor.size(), 0u);
 }
 

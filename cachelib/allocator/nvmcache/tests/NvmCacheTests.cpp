@@ -1266,7 +1266,7 @@ TEST_F(NvmCacheTest, EncodeDecode) {
         auto& cnt = callbacks[it.getKey().str()];
         ++cnt;
 
-        if (it.getKey() == failKey) {
+        if (it.getKey() == Item::Key{failKey}) {
           return false;
         }
 

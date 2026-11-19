@@ -79,7 +79,7 @@ class TestEventInterface : public facebook::cachelib::EventInterface<Key> {
              const SizeT& valueSize,
              TtlT ttl) {
     ASSERT_EQ(event, lastEvent);
-    ASSERT_EQ(key, lastKey);
+    ASSERT_EQ(key, Key{lastKey});
     ASSERT_EQ(result, lastResult);
     ASSERT_EQ(valueSize, lastValueSize);
     ASSERT_EQ(ttl, lastTtl);

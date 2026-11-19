@@ -78,7 +78,7 @@ CO_TYPED_TEST(CacheComponentTest, AllocateBasic) {
       co_await this->cache_->allocate(key, size, creationTime, ttlSecs));
 
   EXPECT_EQ(descriptor.capacity(), size);
-  EXPECT_EQ(descriptor.key(), key);
+  EXPECT_EQ(descriptor.key(), Key{key});
   EXPECT_EQ(descriptor.creationTime(), creationTime);
   EXPECT_EQ(descriptor.expiryTime(), creationTime + ttlSecs);
 }
@@ -190,7 +190,7 @@ CO_TYPED_TEST(CacheComponentTest, InsertOrReplaceExistingItem) {
   // Some implementations may not return the old data -- and that's ok!
   if (result2.has_value()) {
     auto& replacedHandle = result2.value();
-    EXPECT_EQ(replacedHandle->getKey(), key);
+    EXPECT_EQ(replacedHandle->getKey(), Key{key});
 
     std::string replacedData(replacedHandle->template getMemoryAs<const char>(),
                              data1.size());
@@ -244,7 +244,7 @@ CO_TYPED_TEST(CacheComponentTest, InsertOrReplaceDifferentSizes) {
 
   if (result2.has_value()) {
     auto& replacedSmallHandle = result2.value();
-    EXPECT_EQ(replacedSmallHandle->getKey(), key);
+    EXPECT_EQ(replacedSmallHandle->getKey(), Key{key});
     EXPECT_GE(replacedSmallHandle->getMemorySize(), smallData.size());
     std::string retrievedSmall(
         replacedSmallHandle->template getMemoryAs<const char>(),
@@ -269,7 +269,7 @@ CO_TYPED_TEST(CacheComponentTest, InsertOrReplaceDifferentSizes) {
 
   if (result3.has_value()) {
     auto& replacedLargeHandle = result3.value();
-    EXPECT_EQ(replacedLargeHandle->getKey(), key);
+    EXPECT_EQ(replacedLargeHandle->getKey(), Key{key});
     EXPECT_GE(replacedLargeHandle->getMemorySize(), largeData.size());
     std::string retrievedLarge2(
         replacedLargeHandle->template getMemoryAs<const char>(),
@@ -303,7 +303,7 @@ CO_TYPED_TEST(CacheComponentTest, FindExistingItem) {
   CO_ASSERT_TRUE(findResult.has_value());
 
   auto& descriptor = findResult.value();
-  EXPECT_EQ(descriptor.key(), key);
+  EXPECT_EQ(descriptor.key(), Key{key});
 
   std::string retrievedData(static_cast<const char*>(descriptor.data()),
                             descriptor.size());
@@ -331,7 +331,7 @@ CO_TYPED_TEST(CacheComponentTest, FindMultipleItems) {
     auto findResult = CO_ASSERT_OK(co_await this->cache_->find(key));
     CO_ASSERT_TRUE(findResult.has_value());
     auto foundHandle = std::move(findResult.value()).release();
-    EXPECT_EQ(foundHandle->getKey(), key);
+    EXPECT_EQ(foundHandle->getKey(), Key{key});
   }
 }
 
@@ -362,7 +362,7 @@ CO_TYPED_TEST(CacheComponentTest, FindPropertiesMatch) {
   CO_ASSERT_TRUE(findResult.has_value());
 
   auto foundHandle = std::move(findResult.value()).release();
-  EXPECT_EQ(foundHandle->getKey(), key);
+  EXPECT_EQ(foundHandle->getKey(), Key{key});
   EXPECT_GE(foundHandle->getMemorySize(), size);
   EXPECT_EQ(foundHandle->getCreationTime(), creationTime);
   EXPECT_EQ(foundHandle->getExpiryTime(), creationTime + ttlSecs);
@@ -385,7 +385,7 @@ CO_TYPED_TEST(CacheComponentTest, FindToWriteExistingItem) {
   CO_ASSERT_TRUE(writeResult.has_value());
 
   auto& descriptor = writeResult.value();
-  EXPECT_EQ(descriptor.key(), key);
+  EXPECT_EQ(descriptor.key(), Key{key});
   CO_ASSERT_GE(descriptor.size(), originalData.size());
   EXPECT_EQ(
       std::memcmp(descriptor.data(), originalData.data(), originalData.size()),
