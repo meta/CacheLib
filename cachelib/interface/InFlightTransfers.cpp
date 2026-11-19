@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace facebook::cachelib::interface {
@@ -55,6 +56,7 @@ struct InFlightTransfers::Entry {
   std::weak_ptr<Entry> self;
   std::mutex mutex;
   std::weak_ptr<Registration> current;
+  std::weak_ptr<GetCtx> lookup;
 };
 
 struct InFlightTransfers::Registration {
@@ -78,6 +80,19 @@ struct InFlightTransfers::Registration {
   bool isTransfer() const noexcept { return cancellation_.canBeCancelled(); }
 };
 
+struct InFlightTransfers::GetCtx {
+  explicit GetCtx(std::shared_ptr<Entry> entryValue)
+      : entry(std::move(entryValue)) {}
+  GetCtx(const GetCtx&) = delete;
+  GetCtx& operator=(const GetCtx&) = delete;
+  GetCtx(GetCtx&&) = delete;
+  GetCtx& operator=(GetCtx&&) = delete;
+
+  std::shared_ptr<Entry> entry;
+  std::optional<LookupResult> result{std::in_place, std::nullopt};
+  folly::coro::Baton finished_;
+};
+
 InFlightTransfers::InFlightTransfers() : state_(std::make_shared<State>()) {}
 
 std::shared_ptr<InFlightTransfers::Entry> InFlightTransfers::getOrCreateEntry(
@@ -98,6 +113,80 @@ std::shared_ptr<InFlightTransfers::Entry> InFlightTransfers::getOrCreateEntry(
                                         return !existing;
                                       });
   return existing ? std::move(existing) : std::move(entry);
+}
+
+InFlightTransfers::LookupWaiter::LookupWaiter(
+    std::shared_ptr<GetCtx> context) noexcept
+    : context_(std::move(context)) {}
+
+folly::coro::Task<InFlightTransfers::SharedLookupResult>
+InFlightTransfers::LookupWaiter::wait() const {
+  return waitForLookup(context_);
+}
+
+folly::coro::Task<InFlightTransfers::SharedLookupResult>
+InFlightTransfers::waitForLookup(std::shared_ptr<GetCtx> context) {
+  co_await context->finished_;
+  co_return SharedLookupResult{context, &*context->result};
+}
+
+InFlightTransfers::LookupOwner::LookupOwner(
+    std::shared_ptr<GetCtx> context) noexcept
+    : context_(std::move(context)) {}
+
+InFlightTransfers::LookupOwner::~LookupOwner() { finish(); }
+
+InFlightTransfers::LookupOwner& InFlightTransfers::LookupOwner::operator=(
+    LookupOwner&& other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  LookupOwner previous{std::move(*this)};
+  context_ = std::move(other.context_);
+  return *this;
+}
+
+bool InFlightTransfers::LookupOwner::complete(LookupResult result) noexcept {
+  static_assert(std::is_nothrow_move_constructible_v<LookupResult>);
+  if (!context_) {
+    return false;
+  }
+  context_->result.emplace(std::move(result));
+  finish();
+  return true;
+}
+
+void InFlightTransfers::LookupOwner::finish() noexcept {
+  auto context = std::move(context_);
+  if (!context) {
+    return;
+  }
+  auto& entry = *context->entry;
+  {
+    std::lock_guard lock{entry.mutex};
+    if (!entry.lookup.owner_before(context) &&
+        !context.owner_before(entry.lookup)) {
+      entry.lookup.reset();
+    }
+  }
+  context->finished_.post();
+}
+
+InFlightTransfers::LookupRegistration InFlightTransfers::joinOrCreateLookup(
+    Key key) {
+  auto entry = getOrCreateEntry(state_, std::string{key.data(), key.size()});
+  std::shared_ptr<GetCtx> context;
+  std::optional<LookupOwner> owner;
+  {
+    std::lock_guard lock{entry->mutex};
+    context = entry->lookup.lock();
+    if (!context) {
+      context = std::make_shared<GetCtx>(entry);
+      owner.emplace(LookupOwner{context});
+      entry->lookup = context;
+    }
+  }
+  return {LookupWaiter{std::move(context)}, std::move(owner)};
 }
 
 InFlightTransfers::RegistrationGuard::RegistrationGuard(

@@ -24,6 +24,8 @@
 #include <string>
 
 #include "cachelib/interface/CacheItem.h"
+#include "cachelib/interface/Handle.h"
+#include "cachelib/interface/Result.h"
 
 namespace facebook::cachelib::interface {
 
@@ -33,10 +35,12 @@ namespace facebook::cachelib::interface {
  * A key operation guard waits for the key's transfer and earlier guards,
  * optionally requests transfer cancellation, and keeps new transfers out
  * until it is released.
+ * Lookups coalesce independently of transfer and mutation reservations.
  */
 class InFlightTransfers {
  private:
   struct Entry;
+  struct GetCtx;
   struct Registration;
   struct State;
 
@@ -90,12 +94,70 @@ class InFlightTransfers {
     RegistrationGuard registration_;
   };
 
+  using LookupResult = Result<std::optional<ReadHandle>>;
+  using SharedLookupResult = std::shared_ptr<const LookupResult>;
+
+  class LookupWaiter {
+   public:
+    LookupWaiter(const LookupWaiter&) = default;
+    LookupWaiter& operator=(const LookupWaiter&) = default;
+    LookupWaiter(LookupWaiter&&) noexcept = default;
+    LookupWaiter& operator=(LookupWaiter&&) noexcept = default;
+
+    // Captures the context immediately. The task ignores caller cancellation
+    // and can outlive this waiter and the registry. The returned shared result
+    // keeps a hit pinned. Only call on a non-moved-from waiter.
+    folly::coro::Task<SharedLookupResult> wait() const;
+
+   private:
+    friend InFlightTransfers;
+    explicit LookupWaiter(std::shared_ptr<GetCtx> context) noexcept;
+
+    std::shared_ptr<GetCtx> context_;
+  };
+
+  class LookupOwner {
+   public:
+    LookupOwner() = default;
+    ~LookupOwner();
+    LookupOwner(const LookupOwner&) = delete;
+    LookupOwner& operator=(const LookupOwner&) = delete;
+    LookupOwner(LookupOwner&&) noexcept = default;
+    LookupOwner& operator=(LookupOwner&& other) noexcept;
+
+    // Completes once; returns false if already completed or moved from.
+    // A hit must contain an ingress handle for this key. Its component must
+    // outlive every waiter, task, and shared result retaining that handle.
+    // Destruction or replacement of an unfinished owner completes with a miss.
+    bool complete(LookupResult result) noexcept;
+
+   private:
+    friend InFlightTransfers;
+    explicit LookupOwner(std::shared_ptr<GetCtx> context) noexcept;
+    void finish() noexcept;
+
+    std::shared_ptr<GetCtx> context_;
+  };
+
+  struct LookupRegistration {
+    LookupWaiter waiter;
+    std::optional<LookupOwner> owner;
+  };
+
   InFlightTransfers();
   ~InFlightTransfers() = default;
   InFlightTransfers(const InFlightTransfers&) = delete;
   InFlightTransfers& operator=(const InFlightTransfers&) = delete;
   InFlightTransfers(InFlightTransfers&&) = delete;
   InFlightTransfers& operator=(InFlightTransfers&&) = delete;
+
+  // Joins or creates the lookup synchronously. Only its first caller receives
+  // an owner; all waiters observe the same shared result. Completing the owner
+  // unregisters the lookup before waking waiters, allowing a new lookup to
+  // start. Registration does not reserve the key or validate cache state:
+  // callers must coordinate publication and mutations. Transfers complete
+  // independently.
+  LookupRegistration joinOrCreateLookup(Key key);
 
   // Returns nullopt while a transfer is registered or a key operation guard is
   // pending or held for this key. Destroying the owning token releases the
@@ -148,6 +210,9 @@ class InFlightTransfers {
       std::shared_ptr<Registration> node);
   static folly::coro::Task<KeyOperationGuard> lockForOperationImpl(
       std::shared_ptr<State> state, std::string key, TransferPolicy policy);
+
+  static folly::coro::Task<SharedLookupResult> waitForLookup(
+      std::shared_ptr<GetCtx> context);
 
   std::shared_ptr<State> state_;
 };
