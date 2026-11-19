@@ -2003,9 +2003,10 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     const auto sizes = this->getValidAllocSizes(alloc, poolId, nSizes, keyLen);
 
     this->fillUpPoolUntilEvictions(alloc, poolId, sizes, keyLen);
-    size_t lruLength = 0;
-    this->estimateLruSize(alloc, poolId, sizes[0], keyLen, evictedKeys,
-                          lruLength);
+    const auto classId = alloc.getPool(poolId).getAllocationClassId(
+        AllocatorT::Item::getRequiredSize(keyLen, sizes[0]));
+    const size_t lruLength =
+        alloc.getPoolStats(poolId).cacheStats.at(classId).numItems();
     ASSERT_GT(lruLength, 0);
 
     const unsigned int nHotItems =
@@ -2025,6 +2026,11 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       otherKeys.insert(key);
       auto handle = util::allocateAccessible(alloc, poolId, key, sizes[0]);
       ASSERT_NE(handle, nullptr);
+    }
+
+    for (const auto& key : hotKeys) {
+      ASSERT_EQ(evictedKeys.find(key), evictedKeys.end())
+          << "hot key evicted during setup before its first access";
     }
 
     auto accessHotKeys = [&alloc, &hotKeys]() {
