@@ -113,6 +113,12 @@ class InFlightTransfers {
   // may outlive this registry.
   folly::coro::Task<void> cancelAndWait(Key key);
 
+  // Snapshots the current tail only if it is a transfer, without cancelling.
+  // A queued guard hides earlier transfers and is not waited for. The task
+  // does not reserve the key, ignores caller cancellation, and may outlive
+  // this registry. Recheck cache state after waiting.
+  folly::coro::Task<void> waitForTransfer(Key key);
+
   // When awaited, reserves the key and waits for its transfer and earlier
   // guards in registration order. New transfers stay blocked until release.
   // CancelAndWait requests cancellation only when the immediate predecessor

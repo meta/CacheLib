@@ -140,6 +140,14 @@ folly::coro::Task<void> InFlightTransfers::cancelAndWait(Key key) {
   return waitForCompletion(std::move(node));
 }
 
+folly::coro::Task<void> InFlightTransfers::waitForTransfer(Key key) {
+  auto node = findRegistration(key);
+  if (node && !node->cancellation_.canBeCancelled()) {
+    node.reset();
+  }
+  return waitForCompletion(std::move(node));
+}
+
 folly::coro::Task<void> InFlightTransfers::waitForCompletion(
     std::shared_ptr<Registration> node) {
   if (node) {
