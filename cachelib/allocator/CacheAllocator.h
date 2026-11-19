@@ -3757,8 +3757,8 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
 
   if (ctx == RemoveContext::kEviction) {
     const auto timeNow = util::getCurrentTimeSec();
-    if (it.isExpired(timeNow)) {
-      stats_.numRamExpiredEvict.inc();
+    if (!it.isExpired(timeNow)) {
+      stats_.numRamNonExpiredEvict.inc();
     }
     const auto refreshTime = timeNow - it.getLastAccessTime();
     const auto lifeTime = timeNow - it.getCreationTime();
@@ -6067,13 +6067,6 @@ bool CacheAllocator<CacheTrait>::removeIfExpired(const ReadHandle& handle) {
                                  RemoveContext::kExpired, config_.preRemoveCb);
   if (removedHandle) {
     removeFromMMContainer(*(handle.getInternal()));
-    const auto allocInfo = allocator_->getAllocInfo(handle->getMemory());
-    if (handle->hasChainedItem()) {
-      (*stats_.chainedItemEvictions)[allocInfo.poolId][allocInfo.classId].inc();
-    } else {
-      (*stats_.regularItemEvictions)[allocInfo.poolId][allocInfo.classId].inc();
-    }
-    stats_.numRamExpiredEvict.inc();
     return true;
   }
 

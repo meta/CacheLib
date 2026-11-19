@@ -66,7 +66,7 @@ void Stats::populateGlobalCacheStats(GlobalCacheStats& ret) const {
   ret.numCacheRemoves = numCacheRemoves.get();
   ret.numCacheRemoveRamHits = numCacheRemoveRamHits.get();
   ret.numCacheEvictions = numCacheEvictions.get();
-  ret.numRamExpiredEvict = numRamExpiredEvict.get();
+  ret.numRamNonExpiredEvict = numRamNonExpiredEvict.get();
   ret.numRamDestructorCalls = numRamDestructorCalls.get();
   ret.numDestructorExceptions = numDestructorExceptions.get();
 

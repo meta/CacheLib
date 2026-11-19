@@ -54,8 +54,8 @@ struct Stats {
   // number of evictions where items leave both RAM and NvmCache entirely
   TLCounter numCacheEvictions{0};
 
-  // number of expired items removed from RAM by eviction or the reaper
-  TLCounter numRamExpiredEvict{0};
+  // number of RAM evictions of items that were not expired
+  TLCounter numRamNonExpiredEvict{0};
 
   // number of item destructor calls from ram
   TLCounter numRamDestructorCalls{0};

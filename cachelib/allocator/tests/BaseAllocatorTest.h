@@ -4219,69 +4219,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
               allocator.getGlobalCacheStats().numCacheGetMiss);
   }
 
-  void testExpiredReapingStats(bool hasChainedItem) {
-    typename AllocatorT::Config config;
-    config.setCacheSize(3 * Slab::kSize);
-    config.reaperInterval = std::chrono::milliseconds{0};
-    AllocatorT alloc(config);
-    const auto poolId = alloc.addPool("default", Slab::kSize);
-
-    auto handle = util::allocateAccessible(alloc, poolId, "expired", 100);
-    ASSERT_NE(nullptr, handle);
-    if (hasChainedItem) {
-      auto chained = alloc.allocateChainedItem(handle, 100);
-      ASSERT_NE(nullptr, chained);
-      alloc.addChainedItem(handle, std::move(chained));
-    }
-    EXPECT_FALSE(alloc.removeIfExpired(handle));
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numRamExpiredEvict);
-
-    // Holding another handle prevents removing even if it's expired
-    ASSERT_TRUE(handle->updateExpiryTime(util::getCurrentTimeSec() - 1));
-    auto otherHandle = alloc.findInternal("expired");
-    EXPECT_FALSE(alloc.removeIfExpired(handle));
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numRamExpiredEvict);
-    otherHandle.reset();
-
-    EXPECT_EQ(nullptr, alloc.find("expired"));
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numRamExpiredEvict);
-    ASSERT_TRUE(alloc.removeIfExpired(handle));
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numRamExpiredEvict);
-    EXPECT_FALSE(alloc.removeIfExpired(handle));
-    handle.reset();
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numRamExpiredEvict);
-
-    bool counterExported = false;
-    bool totalCounterExported = false;
-    alloc.exportStats("test.", std::chrono::seconds{60},
-                      [&](folly::StringPiece name, uint64_t value) {
-                        if (name == "test.ram.evictions.expired.60") {
-                          EXPECT_EQ(1, value);
-                          counterExported = true;
-                        }
-                        if (name == "test.ram.evictions.60") {
-                          EXPECT_EQ(1, value);
-                          totalCounterExported = true;
-                        }
-                      });
-    EXPECT_TRUE(counterExported);
-    EXPECT_TRUE(totalCounterExported);
-
-    handle = util::allocateAccessible(alloc, poolId, "removed", 100);
-    ASSERT_NE(nullptr, handle);
-    ASSERT_TRUE(handle->updateExpiryTime(util::getCurrentTimeSec() - 1));
-    ASSERT_EQ(AllocatorT::RemoveRes::kSuccess, alloc.remove("removed"));
-    handle.reset();
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numEvictions);
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numRamExpiredEvict);
-  }
-
-  void testExpiredEvictionStats() {
+  void testNonExpiredEvictionStats() {
     typename AllocatorT::Config config;
     config.setCacheSize(3 * Slab::kSize);
     config.reaperInterval = std::chrono::milliseconds{0};
@@ -4289,10 +4227,15 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     const auto poolId = alloc.addPool("default", Slab::kSize);
     constexpr unsigned int kKeyLen = 16;
     const std::vector<uint32_t> sizes{1000};
+    // Items have no TTL, so every eviction while filling the pool is of a live
+    // item and must be counted as non-expired.
     this->fillUpPoolUntilEvictions(alloc, poolId, sizes, kKeyLen);
-    ASSERT_GT(alloc.getGlobalCacheStats().numEvictions, 0);
-    EXPECT_EQ(0, alloc.getGlobalCacheStats().numRamExpiredEvict);
+    const auto numLiveEvictions = alloc.getGlobalCacheStats().numEvictions;
+    ASSERT_GT(numLiveEvictions, 0);
+    EXPECT_EQ(numLiveEvictions,
+              alloc.getGlobalCacheStats().numRamNonExpiredEvict);
 
+    // Expire every item; no eviction from here on should be counted.
     uint64_t numExpired = 0;
     for (const auto& item : alloc) {
       auto handle = alloc.findInternal(item.getKey());
@@ -4302,15 +4245,31 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     }
     ASSERT_GT(numExpired, 1);
 
+    // The pool is full, so this allocation evicts an expired item from the LRU.
     auto handle = util::allocateAccessible(
         alloc, poolId, this->getRandomNewKey(alloc, kKeyLen), sizes[0]);
     ASSERT_NE(nullptr, handle);
-    EXPECT_EQ(1, alloc.getGlobalCacheStats().numRamExpiredEvict);
+    EXPECT_EQ(numLiveEvictions,
+              alloc.getGlobalCacheStats().numRamNonExpiredEvict);
+    // Expire the new item too, so the slab release only evicts expired items.
+    ASSERT_TRUE(handle->updateExpiryTime(util::getCurrentTimeSec() - 1));
     const auto classId = alloc.getAllocInfo(handle->getMemory()).classId;
     handle.reset();
-
+    // Without a moveCb, slab release evicts every item in the slab.
     alloc.releaseSlab(poolId, classId, SlabReleaseMode::kResize);
-    EXPECT_EQ(numExpired, alloc.getGlobalCacheStats().numRamExpiredEvict);
+    EXPECT_GT(alloc.getGlobalCacheStats().numEvictions, numLiveEvictions);
+    EXPECT_EQ(numLiveEvictions,
+              alloc.getGlobalCacheStats().numRamNonExpiredEvict);
+
+    bool counterExported = false;
+    alloc.exportStats("test.", std::chrono::seconds{60},
+                      [&](folly::StringPiece name, uint64_t value) {
+                        if (name == "test.ram.evictions.non_expired.60") {
+                          EXPECT_EQ(numLiveEvictions, value);
+                          counterExported = true;
+                        }
+                      });
+    EXPECT_TRUE(counterExported);
   }
 
   void testAllocateWithItemsReaper() {

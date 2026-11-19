@@ -224,13 +224,8 @@ TYPED_TEST(BaseAllocatorTest, AllocateWithTTL) { this->testAllocateWithTTL(); }
 
 TYPED_TEST(BaseAllocatorTest, ExpiredFind) { this->testExpiredFind(); }
 
-TYPED_TEST(BaseAllocatorTest, ExpiredReapingStats) {
-  this->testExpiredReapingStats(false);
-  this->testExpiredReapingStats(true);
-}
-
-TYPED_TEST(BaseAllocatorTest, ExpiredEvictionStats) {
-  this->testExpiredEvictionStats();
+TYPED_TEST(BaseAllocatorTest, NonExpiredEvictionStats) {
+  this->testNonExpiredEvictionStats();
 }
 
 TYPED_TEST(BaseAllocatorTest, AllocateWithItemsReaper) {
