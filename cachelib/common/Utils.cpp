@@ -16,6 +16,7 @@
 
 #include <dirent.h>
 #include <fmt/core.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/debugging/exception_tracer/ExceptionTracer.h>
 #include <sys/mman.h>
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #pragma GCC diagnostic push
@@ -34,6 +36,7 @@
 #include <folly/Random.h>
 #include <folly/logging/xlog.h>
 
+#include "cachelib/common/PageSize.h"
 #include "cachelib/common/Utils.h"
 
 namespace facebook {
@@ -168,40 +171,65 @@ void* align(size_t alignment, size_t size, void*& ptr, size_t& space) {
 void* mmapAlignedZeroedMemory(size_t alignment,
                               size_t numBytes,
                               bool noAccess,
-                              int extraMmapFlags) {
-  // Over-map by `alignment` so the returned address can be shifted up to an
-  // aligned boundary.
-  const size_t mappedBytes = numBytes + alignment;
+                              const PageSize& pageSize) {
+  if (!folly::isPowTwo(alignment) || numBytes == 0 ||
+      numBytes > std::numeric_limits<size_t>::max() - alignment) {
+    throw std::invalid_argument("Invalid aligned mmap size or alignment");
+  }
+  size_t mappedBytes = numBytes + alignment;
+  size_t keptBytes = numBytes;
+  if (!pageSize.isHugePage()) {
+    const auto basePageSize = getPageSize();
+    if (mappedBytes > std::numeric_limits<size_t>::max() - (basePageSize - 1)) {
+      throw std::invalid_argument("Aligned mmap size overflows page rounding");
+    }
+    mappedBytes =
+        getAlignedSize(mappedBytes, static_cast<uint32_t>(basePageSize));
+    keptBytes = getAlignedSize(numBytes, static_cast<uint32_t>(basePageSize));
+  }
   const auto protFlag = noAccess ? PROT_NONE : PROT_READ | PROT_WRITE;
-  const auto mapFlag =
-      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | extraMmapFlags;
+  const auto mapFlag = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                       pageSize.hugePageMmapFlags();
   void* base = mmap(nullptr, mappedBytes, protFlag, mapFlag, -1, 0);
   if (base == MAP_FAILED) {
     throw std::system_error(errno, std::system_category(), "Cannot mmap");
   }
+  auto* ownedStart = static_cast<uint8_t*>(base);
+  size_t ownedBytes = mappedBytes;
+  auto rollback = folly::makeGuard([&] { munmap(ownedStart, ownedBytes); });
 
   void* memory = base;
   size_t space = mappedBytes;
   auto* alignedMemory = align(alignment, numBytes, memory, space);
-  XDCHECK_NE(alignedMemory, nullptr);
-
-  // For HugeTLB mappings release the alignment slack rather than stranding up
-  // to a full huge page. Callers pass a huge-page aligned numBytes, so the
-  // mapping becomes exactly [alignedMemory, alignedMemory + numBytes) and both
-  // trims fall on huge-page boundaries. The normal-page path keeps its
-  // historical over-mapping.
-  if (extraMmapFlags != 0) {
-    auto* alignedBytes = static_cast<uint8_t*>(alignedMemory);
-    const size_t head = alignedBytes - static_cast<uint8_t*>(base);
-    if (head != 0) {
-      munmap(base, head);
-    }
-    const size_t tail = mappedBytes - head - numBytes;
-    if (tail != 0) {
-      munmap(alignedBytes + numBytes, tail);
-    }
+  if (alignedMemory == nullptr) {
+    throw std::invalid_argument("Cannot align mmap reservation");
   }
+  auto* alignedBytes = static_cast<uint8_t*>(alignedMemory);
+  const size_t head = mappedBytes - space;
+  if (head != 0) {
+    if (munmap(ownedStart, head) != 0) {
+      throw std::system_error(errno, std::system_category(),
+                              "Cannot trim mmap head");
+    }
+    ownedStart = alignedBytes;
+    ownedBytes -= head;
+  }
+  const size_t tail = ownedBytes - keptBytes;
+  if (tail != 0) {
+    if (munmap(alignedBytes + keptBytes, tail) != 0) {
+      throw std::system_error(errno, std::system_category(),
+                              "Cannot trim mmap tail");
+    }
+    ownedBytes = keptBytes;
+  }
+  rollback.dismiss();
   return alignedMemory;
+}
+
+void* mmapAlignedZeroedMemory(size_t alignment,
+                              size_t numBytes,
+                              bool noAccess) {
+  return mmapAlignedZeroedMemory(alignment, numBytes, noAccess, PageSize{});
 }
 
 void setMaxLockMemory(uint64_t bytes) {

@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -383,6 +384,14 @@ class SlabAllocator {
   // reach 2^16 - 1;
   static constexpr SlabIdx kNullSlabIdx = std::numeric_limits<SlabIdx>::max();
 
+  struct MappingDeleter {
+    size_t length;
+    void operator()(void* memory) const noexcept;
+  };
+  using OwnedMemory = std::unique_ptr<void, MappingDeleter>;
+  static OwnedMemory allocateOwnedMemory(size_t size, const PageSize& pageSize);
+  SlabAllocator(OwnedMemory memory, size_t memorySize, const Config& config);
+
   // used for delegation from the first two types of constructors.
   SlabAllocator(void* memoryStart,
                 size_t memorySize,
@@ -479,8 +488,9 @@ class SlabAllocator {
   const bool ownsMemory_{true};
 
   // when ownsMemory_, the length of the mmap backing memoryStart_; used to
-  // munmap the full region. Exceeds memorySize_ for huge-page mappings, which
-  // round up to the huge-page size. Zero when the memory is caller-provided.
+  // munmap the full region. The requested size rounded up to the mapping's page
+  // size, so it can exceed memorySize_. Zero when the memory is
+  // caller-provided.
   size_t mmapLength_{0};
 
 #if FOLLY_SANITIZE_ADDRESS

@@ -877,8 +877,7 @@ ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
         pageSize.getPageAlignedSize(numBuckets_ * sizeof(CompressedPtrType));
     hashTable_.reset(static_cast<CompressedPtrType*>(
         util::mmapAlignedZeroedMemory(pageSize.getPageSize(), mmapBytes_,
-                                      /*noAccess=*/false,
-                                      pageSize.hugePageMmapFlags())));
+                                      /*noAccess=*/false, pageSize)));
   } else {
     hashTable_ = std::make_unique<CompressedPtrType[]>(numBuckets_);
   }

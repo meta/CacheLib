@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "cachelib/shm/ShmCommon.h"
+#include "cachelib/common/PageSize.h"
 
 #include <fmt/core.h>
 #include <folly/Conv.h>

@@ -17,7 +17,6 @@ add_thrift_file(SHM shm.thrift frozen2)
 add_library (cachelib_shm
   ${SHM_THRIFT_FILES}
   PosixShmSegment.cpp
-  ShmCommon.cpp
   ShmManager.cpp
   SysVShmSegment.cpp
   )

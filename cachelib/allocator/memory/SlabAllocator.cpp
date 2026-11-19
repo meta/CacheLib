@@ -19,6 +19,7 @@
 #include <fmt/core.h>
 #include <folly/Likely.h>
 #include <folly/Random.h>
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 #include <folly/synchronization/SanitizeThread.h>
 #include <sys/mman.h>
@@ -27,8 +28,8 @@
 #include <chrono>
 #include <stdexcept>
 
+#include "cachelib/common/PageSize.h"
 #include "cachelib/common/Utils.h"
-#include "cachelib/shm/ShmCommon.h"
 
 /* Missing madvise(2) flags on MacOS */
 #ifndef MADV_REMOVE
@@ -45,31 +46,25 @@ static inline size_t roundDownToSlabSize(size_t size) {
   return size - (size % sizeof(Slab));
 }
 
-// Length of the mmap backing a self-allocating SlabAllocator. Huge-page
-// mappings must be huge-page aligned, so the reservation is rounded up past the
-// requested size.
-size_t ownedMmapLength(size_t size, const PageSize& pageSize) {
-  return pageSize.isHugePage() ? pageSize.getPageAlignedSize(size) : size;
-}
-
-// Allocate the mmap-owned backing memory for a self-allocating SlabAllocator,
-// optionally backed by anonymous HugeTLB pages
-void* allocateOwnedSlabMemory(size_t size, const PageSize& pageSize) {
-  const size_t mapSize = ownedMmapLength(size, pageSize);
-  if (!pageSize.isHugePage()) {
-    return util::mmapAlignedZeroedMemory(sizeof(Slab), mapSize);
-  }
-  const size_t alignment = std::max(sizeof(Slab), pageSize.getPageSize());
-  return util::mmapAlignedZeroedMemory(alignment, mapSize, /*noAccess=*/false,
-                                       pageSize.hugePageMmapFlags());
-}
-
 FOLLY_DISABLE_ADDRESS_SANITIZER void touchAddr(const uint8_t* addr) {
   // Use volatile to fool the compiler to not optimize this away in opt mode.
   volatile const uint8_t val = *addr; // NOLINT(facebook-hte-Volatile)
   (void)val;
 }
 } // namespace
+
+void SlabAllocator::MappingDeleter::operator()(void* memory) const noexcept {
+  munmap(memory, length);
+}
+
+SlabAllocator::OwnedMemory SlabAllocator::allocateOwnedMemory(
+    size_t size, const PageSize& pageSize) {
+  const size_t mapSize = pageSize.getPageAlignedSize(size);
+  const size_t alignment = std::max(sizeof(Slab), pageSize.getPageSize());
+  return OwnedMemory{util::mmapAlignedZeroedMemory(
+                         alignment, mapSize, /*noAccess=*/false, pageSize),
+                     MappingDeleter{mapSize}};
+}
 
 void SlabAllocator::checkState() const {
   if (memoryStart_ == nullptr || memorySize_ <= Slab::kSize) {
@@ -128,12 +123,18 @@ void SlabAllocator::stopMemoryLocker() {
 }
 
 SlabAllocator::SlabAllocator(size_t size, const Config& config)
-    : SlabAllocator(allocateOwnedSlabMemory(size, config.hugePageSize),
-                    size,
-                    true,
-                    config) {
-  mmapLength_ = ownedMmapLength(size, config.hugePageSize);
+    : SlabAllocator(
+          allocateOwnedMemory(size, config.hugePageSize), size, config) {
   XDCHECK(!isRestorable());
+}
+
+SlabAllocator::SlabAllocator(OwnedMemory memory,
+                             size_t size,
+                             const Config& config)
+    : SlabAllocator(memory.get(), size, true, config) {
+  mmapLength_ = memory.get_deleter().length;
+  auto* released = memory.release();
+  XDCHECK_EQ(released, memoryStart_);
 }
 
 SlabAllocator::SlabAllocator(void* memoryStart,
@@ -157,6 +158,7 @@ SlabAllocator::SlabAllocator(void* memoryStart,
       asanPoisoningEnabled_(config.enableAsanPoisoning)
 #endif
 {
+  auto stopLockerOnFailure = folly::makeGuard([this] { stopMemoryLocker(); });
   checkState();
 
   static_assert(!(sizeof(Slab) & (sizeof(Slab) - 1)),
@@ -187,6 +189,7 @@ SlabAllocator::SlabAllocator(void* memoryStart,
              reinterpret_cast<uintptr_t>(slabMemoryStart_));
 
   logAsanPoisoningStatus();
+  stopLockerOnFailure.dismiss();
 }
 
 SlabAllocator::SlabAllocator(const serialization::SlabAllocatorObject& object,

@@ -16,6 +16,7 @@
 
 #pragma once
 #include <string>
+#include <utility>
 
 #include "cachelib/allocator/memory/MemoryAllocator.h"
 #include "cachelib/allocator/memory/MemoryPool.h"
@@ -53,6 +54,13 @@ class AllocTestBase : public testing::Test {
     memset(memory, 0, size);
     toFree_.push_back(memory);
     return memory;
+  }
+
+  static SlabAllocator createOwnedSlabAllocator(
+      size_t size, const SlabAllocator::Config& config, void*& backing) {
+    auto memory = SlabAllocator::allocateOwnedMemory(size, config.hugePageSize);
+    backing = memory.get();
+    return SlabAllocator(std::move(memory), size, config);
   }
 
   static constexpr uint32_t getMinAllocSize() noexcept {

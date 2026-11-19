@@ -15,16 +15,20 @@
  */
 
 #include <folly/Random.h>
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 
 #include <atomic>
+#include <cerrno>
+#include <limits>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "cachelib/common/FastStats.h"
+#include "cachelib/common/PageSize.h"
 #include "cachelib/common/Utils.h"
 #include "cachelib/shm/HugePageTestUtils.h"
-#include "cachelib/shm/ShmCommon.h"
 
 using facebook::cachelib::util::FastStats;
 using facebook::cachelib::util::SysctlSetting;
@@ -79,6 +83,7 @@ TEST(Util, FastStats) {
 
   const unsigned int nThreads = folly::Random::rand32(5, 30);
   std::vector<std::thread> threads;
+  threads.reserve(nThreads);
 
   for (unsigned int i = 0; i < nThreads; i++) {
     threads.emplace_back([&]() { doThreadWork(); });
@@ -229,18 +234,47 @@ TEST(Util, CounterVisitor) {
       [&ctrs](folly::StringPiece k, double v) { ctrs[k.str()] = v; });
 }
 
+TEST(Util, MmapAlignedZeroedMemoryNormalPaddingReleased) {
+  constexpr size_t alignment = 4 * 1024 * 1024;
+  const auto pageSize = util::getPageSize();
+  for (const auto bytes : {pageSize - 1, pageSize, pageSize + 1, 2 * alignment,
+                           2 * alignment + 1}) {
+    auto* memory =
+        static_cast<uint8_t*>(util::mmapAlignedZeroedMemory(alignment, bytes));
+    auto cleanup = folly::makeGuard([&] { munmap(memory, bytes); });
+    const auto rounded = (bytes + pageSize - 1) / pageSize * pageSize;
+    unsigned char resident = 0;
+    const auto tail = static_cast<void*>(memory + rounded);
+    const auto tailResult = mincore(tail, pageSize, &resident);
+    const auto tailError = errno;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(memory) % alignment, 0u);
+    EXPECT_EQ(memory[0], 0);
+    EXPECT_EQ(memory[bytes - 1], 0);
+    memory[bytes - 1] = 42;
+    EXPECT_EQ(memory[bytes - 1], 42);
+    EXPECT_EQ(tailResult, -1) << bytes;
+    EXPECT_EQ(tailError, ENOMEM) << bytes;
+  }
+}
+
+TEST(Util, MmapAlignedZeroedMemoryRejectsInvalidGeometry) {
+  EXPECT_THROW(util::mmapAlignedZeroedMemory(3, 4096), std::invalid_argument);
+  EXPECT_THROW(util::mmapAlignedZeroedMemory(4096, 0), std::invalid_argument);
+  EXPECT_THROW(
+      util::mmapAlignedZeroedMemory(4096, std::numeric_limits<size_t>::max()),
+      std::invalid_argument);
+}
+
 TEST(Util, MmapAlignedZeroedMemoryHugeFlagThrowsWhenUnavailable) {
   PageSize ps{PageSize::kHugePageSize2MB};
   const size_t hugeAlign = ps.getPageSize();
   const size_t hugeSize = ps.getPageSize();
-  int hugeFlag = ps.hugePageMmapFlags();
 
   if (!canReserveHugePages(hugeSize, ps)) {
     GTEST_SKIP() << "2MB huge pages not usable";
   }
 
-  void* ptr =
-      util::mmapAlignedZeroedMemory(hugeAlign, hugeSize, false, hugeFlag);
+  void* ptr = util::mmapAlignedZeroedMemory(hugeAlign, hugeSize, false, ps);
   ASSERT_NE(ptr, nullptr);
   EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % hugeAlign, 0u);
   munmap(ptr, hugeSize);

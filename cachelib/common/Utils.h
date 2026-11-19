@@ -34,6 +34,9 @@
 
 namespace facebook {
 namespace cachelib {
+
+class PageSize;
+
 namespace util {
 
 // A wrapper class for functions to collect counters.
@@ -293,20 +296,28 @@ std::enable_if_t<std::is_arithmetic<T>::value, T> getDivCeiling(
 // creates a new mapping in the virtual address space of the calling process
 // aligned by the size of Slab.
 //
-// NOTE: when huge pages are requested, alignment and numBytes must be huge-page
-// aligned.
+// NOTE: when pageSize is a huge page, alignment and numBytes must be huge-page
+// aligned. Alignment padding is released before returning. The caller unmaps
+// numBytes at the returned address; normal-page lengths are kernel-rounded.
 //
 // @param alignment       the desired alignment
 // @param numBytes        the length of the mapping
 // @param noAccess        whether or not this mapping is going to be accessed
-// @param extraMmapFlags  extra flags OR'd into the mmap() flags
-// @return                pointer to aligned memory or nullptr on error
+// @param pageSize        page size backing the mapping; a huge page size maps
+//                        anonymous HugeTLB pages of that size
+// @return                pointer to aligned memory
 //
-// @throw std::system_error if unable to create mapping
+// @throw std::system_error if unable to create or trim the mapping
+// @throw std::invalid_argument for invalid size, alignment, or overflow
 void* mmapAlignedZeroedMemory(size_t alignment,
                               size_t numBytes,
-                              bool noAccess = false,
-                              int extraMmapFlags = 0);
+                              bool noAccess,
+                              const PageSize& pageSize);
+
+// same as above, backed by normal pages
+void* mmapAlignedZeroedMemory(size_t alignment,
+                              size_t numBytes,
+                              bool noAccess = false);
 
 // get the number of pages in the range which are resident in the process.
 //

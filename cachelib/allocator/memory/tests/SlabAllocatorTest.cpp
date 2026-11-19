@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <random>
 #include <vector>
@@ -42,7 +43,49 @@ SlabAllocator::Config getDefaultConfig() {
   return {true /* disableFullCoredump */, false /* lockMemory */,
           true /* enableAsanPoisoning */};
 }
+
+bool isPageMapped(const void* page) {
+  unsigned char resident = 0;
+  return mincore(const_cast<void*>(page), util::getPageSize(), &resident) == 0;
+}
+
+// Number of mapped pages among the numPages pages starting at start.
+size_t countMappedPages(const void* start, size_t numPages) {
+  const auto* first = static_cast<const uint8_t*>(start);
+  size_t mapped = 0;
+  for (size_t i = 0; i < numPages; ++i) {
+    mapped += isPageMapped(first + i * util::getPageSize());
+  }
+  return mapped;
+}
 } // namespace
+
+TEST_F(SlabAllocatorTest, OwnedBackingReleasedOnConstructionFailure) {
+  for (const size_t size : {Slab::kSize, Slab::kSize - 1}) {
+    void* backing = nullptr;
+    EXPECT_THROW(createOwnedSlabAllocator(size, getDefaultConfig(), backing),
+                 std::invalid_argument);
+    ASSERT_NE(backing, nullptr);
+    const size_t keptPages = util::getNumPages(size);
+    EXPECT_EQ(countMappedPages(backing, keptPages), 0u) << size;
+  }
+}
+
+TEST_F(SlabAllocatorTest, OwnedBackingReleasedAfterOddSizeDestruction) {
+  const size_t size = 2 * Slab::kSize + 1;
+  const size_t keptPages = util::getNumPages(size);
+  void* backing = nullptr;
+  {
+    auto allocator =
+        createOwnedSlabAllocator(size, getDefaultConfig(), backing);
+    EXPECT_FALSE(allocator.isRestorable());
+    ASSERT_NE(backing, nullptr);
+    EXPECT_EQ(countMappedPages(backing, keptPages), keptPages);
+    EXPECT_FALSE(isPageMapped(static_cast<uint8_t*>(backing) +
+                              keptPages * util::getPageSize()));
+  }
+  EXPECT_EQ(countMappedPages(backing, keptPages), 0u);
+}
 
 TEST_F(SlabAllocatorTest, SmallMemory) {
   // creating with not enough memory should fail.
