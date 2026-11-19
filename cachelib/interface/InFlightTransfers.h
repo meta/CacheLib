@@ -36,6 +36,7 @@ namespace facebook::cachelib::interface {
  */
 class InFlightTransfers {
  private:
+  struct Entry;
   struct Registration;
   struct State;
 
@@ -140,6 +141,8 @@ class InFlightTransfers {
                                                         TransferPolicy policy);
 
  private:
+  static std::shared_ptr<Entry> getOrCreateEntry(std::shared_ptr<State> state,
+                                                 std::string key);
   std::shared_ptr<Registration> findRegistration(Key key) const;
   static folly::coro::Task<void> waitForCompletion(
       std::shared_ptr<Registration> node);

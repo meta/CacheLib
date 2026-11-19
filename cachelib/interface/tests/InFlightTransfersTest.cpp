@@ -331,6 +331,78 @@ CO_TEST(InFlightTransfersTest, DeferredWaitDoesNotRetainOrCancelReplacement) {
   EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
 }
 
+CO_TEST(InFlightTransfersTest, DestroyingOldWaitersPreservesCurrentOperation) {
+  InFlightTransfers transfers;
+  auto transfer = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  auto firstWait = std::make_optional(transfers.waitForTransfer("key"));
+  transfer.reset();
+  transfer = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(transfer);
+  auto secondWait = std::make_optional(transfers.waitForTransfer("key"));
+  transfer.reset();
+
+  auto guard = co_await transfers.lockForOperation(
+      "key", InFlightTransfers::TransferPolicy::CancelAndWait);
+  firstWait.reset();
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  guard = {};
+
+  auto replacement = transfers.tryAcquireTransferToken("key");
+  CO_ASSERT_TRUE(replacement);
+  secondWait.reset();
+  EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+  EXPECT_FALSE(replacement->getCancellationToken().isCancellationRequested());
+  transfers.cancel("key");
+  EXPECT_TRUE(replacement->getCancellationToken().isCancellationRequested());
+  replacement.reset();
+  EXPECT_TRUE(transfers.tryAcquireTransferToken("key"));
+}
+
+TEST(InFlightTransfersTest, LastWaiterReleaseRacesWithAdmission) {
+  InFlightTransfers transfers;
+  for (size_t iteration = 0; iteration < 64; ++iteration) {
+    SCOPED_TRACE(iteration);
+    auto transfer = transfers.tryAcquireTransferToken("key");
+    ASSERT_TRUE(transfer);
+    auto wait = std::make_optional(transfers.waitForTransfer("key"));
+    transfer.reset();
+
+    std::array<std::optional<InFlightTransfers::TransferToken>, 2> results;
+    std::array<std::thread, 2> admissions;
+    std::promise<void> start;
+    auto ready = start.get_future().share();
+    std::thread reclaimer([&] {
+      ready.wait();
+      wait.reset();
+    });
+    for (size_t worker = 0; worker < admissions.size(); ++worker) {
+      admissions[worker] = std::thread([&, worker] {
+        ready.wait();
+        results[worker] = transfers.tryAcquireTransferToken("key");
+      });
+    }
+    start.set_value();
+    reclaimer.join();
+    for (auto& admission : admissions) {
+      admission.join();
+    }
+
+    size_t winners = 0;
+    for (const auto& result : results) {
+      winners += result.has_value();
+    }
+    ASSERT_EQ(winners, 1);
+    EXPECT_FALSE(transfers.tryAcquireTransferToken("key"));
+    transfers.cancel("key");
+    for (const auto& result : results) {
+      if (result) {
+        EXPECT_TRUE(result->getCancellationToken().isCancellationRequested());
+      }
+    }
+  }
+}
+
 CO_TEST(InFlightTransfersTest, WaitSurvivesRegistryAndKeyDestruction) {
   auto transfers = std::make_unique<InFlightTransfers>();
   auto transfer = transfers->tryAcquireTransferToken("key");
