@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <fmt/format.h>
 #include <folly/Random.h>
 
 #include "cachelib/allocator/MM2Q.h"
@@ -230,9 +231,9 @@ void MMTypeTest<MMType>::testMatch(std::string expected,
   verifyIterationVariants(c);
   auto it2q = c.getEvictionIterator();
   while (it2q) {
-    actual += folly::stringPrintf(
-        "%d:%s, ", it2q->getId(),
-        (c.isHot(*it2q) ? "H" : (c.isCold(*it2q) ? "C" : "W")));
+    actual +=
+        fmt::format("{}:{}, ", it2q->getId(),
+                    (c.isHot(*it2q) ? "H" : (c.isCold(*it2q) ? "C" : "W")));
     ++it2q;
   }
   ASSERT_EQ(expected, actual);

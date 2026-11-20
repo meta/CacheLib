@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <fmt/format.h>
 #include <folly/Random.h>
 
 #include "cachelib/allocator/MMWTinyLFU.h"
@@ -176,9 +177,9 @@ TEST_F(MMWTinyLFUTest, TinyLFUBasic) {
     auto it = container.getEvictionIterator();
     std::string actual;
     while (it) {
-      actual += folly::stringPrintf(
-          "%s:%s, ", it->getKey().str().c_str(),
-          (container.isTiny(*it) ? "T"
+      actual += fmt::format("{}:{}, ", it->getKey().str().c_str(),
+                            (container.isTiny(*it)
+                                 ? "T"
                                  : (container.isProbation(*it) ? "P" : "M")));
       ++it;
     }
