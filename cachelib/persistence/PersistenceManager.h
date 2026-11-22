@@ -119,6 +119,8 @@ class PersistenceManager {
     CACHELIB_CHECK_THROW(!config.slabHugePageSize.isHugePage() &&
                              !config.accessHugePageSize.isHugePage(),
                          "Huge pages are not supported to persist");
+    CACHELIB_CHECK_THROW(config.posixShmDirectory.empty(),
+                         "usePosixShmDirectory() is not supported to persist");
 
     if (config.nvmConfig.has_value()) {
       const auto& navyConfig = config.nvmConfig->navyConfig;

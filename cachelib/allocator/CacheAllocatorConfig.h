@@ -239,6 +239,13 @@ class CacheAllocatorConfig {
   // cachePersistence()
   CacheAllocatorConfig& usePosixForShm();
 
+  // Like usePosixForShm(), but normal-page segments are files in the given
+  // directory instead of /dev/shm. Use an existing tmpfs directory. It is not
+  // saved with the cache: SharedMemAttach with another directory throws.
+  // @throw std::invalid_argument if the directory is empty or called without
+  // enabling cachePersistence()
+  CacheAllocatorConfig& usePosixShmDirectory(std::string directory);
+
   // Requests HugeTLB-backed pages for slab (main cache) memory and access
   // container hash tables; persistence metadata stays on normal pages.
   // Shorthand for enableSlabHugePages + enableAccessHugePages with the same
@@ -570,6 +577,9 @@ class CacheAllocatorConfig {
 
   // if true, uses posix shm; if not, uses sys-v (default)
   bool usePosixShm{false};
+
+  // Directory for normal-page POSIX shm segments; empty means /dev/shm.
+  std::string posixShmDirectory;
 
   // Huge-page size backing the slab memory segment; default => normal pages.
   PageSize slabHugePageSize{};
@@ -1144,6 +1154,17 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::usePosixForShm() {
 }
 
 template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::usePosixShmDirectory(
+    std::string directory) {
+  if (directory.empty()) {
+    throw std::invalid_argument("usePosixShmDirectory() needs a directory");
+  }
+  usePosixForShm();
+  posixShmDirectory = std::move(directory);
+  return *this;
+}
+
+template <typename T>
 void CacheAllocatorConfig<T>::validateHugePageSize(const PageSize& pageSize) {
   if (!pageSize.isHugePage()) {
     throw std::invalid_argument("user didn't specify an actual huge page");
@@ -1543,6 +1564,7 @@ std::map<std::string, std::string> CacheAllocatorConfig<T>::serialize() const {
   configMap["slabHugePageSize"] = pageSizeStr(slabHugePageSize);
   configMap["accessHugePageSize"] = pageSizeStr(accessHugePageSize);
   configMap["hugePageMountDir"] = hugePageMountDir;
+  configMap["posixShmDirectory"] = posixShmDirectory;
 
   configMap["defaultAllocSizes"] = "";
   // Stringify std::set
