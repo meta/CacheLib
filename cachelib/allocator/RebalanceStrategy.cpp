@@ -96,7 +96,10 @@ void RebalanceStrategy::initPoolState(PoolId pid, const PoolStats& stats) {
     curr[id] =
         Info{id, stats.mpStats.acStats.at(id).totalSlabs(),
              stats.cacheStats.at(id).numEvictions(), stats.numHitsForClass(id),
-             stats.cacheStats.at(id).containerStat.numTailAccesses};
+             stats.cacheStats.at(id).containerStat.numTailAccesses,
+             0,
+             stats.numHitsForClass(id) + stats.cacheStats.at(id).allocAttempts,
+             stats.numHitsForClass(id) + stats.cacheStats.at(id).allocAttempts}; // hits + allocs => nr of requests
   }
 }
 
@@ -359,6 +362,69 @@ T RebalanceStrategy::executeAndRecordCurrentState(
   recordCurrentState(pid, poolStats);
 
   return rv;
+}
+
+///// for keeping rebalance decision histories
+void RebalanceStrategy::recordRebalanceEvent(PoolId pid, RebalanceContext ctx, size_t maxQueueSize) {
+  if(ctx.isEffective()) {
+    auto& eventQueue = recentRebalanceEvents_[pid];
+    eventQueue.emplace_back(ctx);
+    if (eventQueue.size() > maxQueueSize) {
+      eventQueue.pop_front();
+    }
+  }
+}
+
+unsigned int RebalanceStrategy::getRebalanceEventQueueSize(PoolId pid) const {
+  const auto it = recentRebalanceEvents_.find(pid);
+  if (it == recentRebalanceEvents_.end()) {
+    return 0;
+  }
+  return it->second.size();
+}
+
+void RebalanceStrategy::clearPoolRebalanceEvent(PoolId pid) {
+  recentRebalanceEvents_.erase(pid);
+}
+
+double RebalanceStrategy::queryEffectiveMoveRate(PoolId pid) const{
+  const auto it = recentRebalanceEvents_.find(pid);
+  if (it == recentRebalanceEvents_.end() || it->second.empty()) {
+      return 1.0;
+  }
+
+  const auto& events = it->second;
+  std::unordered_map<ClassId, int> netChanges;
+
+  for (const auto& ctx : events) {
+      netChanges[ctx.victimClassId]--;
+      netChanges[ctx.receiverClassId]++;
+  }
+
+  int currentAbsNet = 0;
+  for (const auto& [classId, net] : netChanges) {
+      currentAbsNet += std::abs(net);
+  }
+  int totalEffectiveMoves = currentAbsNet / 2;
+
+  return static_cast<double>(totalEffectiveMoves) / events.size();
+}
+
+double RebalanceStrategy::getMinDiffValueFromRebalanceEvents(PoolId pid) const {
+  const auto it = recentRebalanceEvents_.find(pid);
+  if (it == recentRebalanceEvents_.end() || it->second.empty()) {
+    return 0.0; // Return 0.0 if the queue is empty or the pool ID is not found
+  }
+
+  const auto& events = it->second;
+
+  // Find the minimum diffValue in the queue
+  double minDiffValue = std::numeric_limits<double>::max();
+  for (const auto& ctx : events) {
+    minDiffValue = std::min(minDiffValue, ctx.diffValue);
+  }
+
+  return minDiffValue;
 }
 
 } // namespace facebook::cachelib
