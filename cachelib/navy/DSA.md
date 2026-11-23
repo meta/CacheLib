@@ -20,12 +20,38 @@ device configuration, so set up the work queues before starting the cache.
 
 Navy submits DSA operations with DTO's block-on-fault flag. On a work queue
 with block-on-fault enabled, a page fault in a source or destination buffer
-makes the device wait while the kernel resolves it, and the operation
-completes on DSA. On a work queue without it, DTO drops the flag because the
-device would reject it. A page fault then stops the operation partway, and
-Navy redoes the whole operation on the CPU. Results stay correct, but the
-offload is lost, for example for copies into newly allocated buffers whose
-pages have not been touched yet.
+makes DSA wait for the kernel to resolve the fault before finishing the
+operation. On a queue without block-on-fault, DTO drops the flag because the
+device would reject it. If DSA hits a page fault on that queue, Navy redoes the
+whole operation on the CPU. This can happen, for example, when copying into a
+new buffer whose pages have not been touched yet. Results stay correct, but the
+offload is lost.
+
+### Diagnose page faults
+
+To confirm a page fault, start the cache with `DTO_LOG_LEVEL=1`. A DTO message
+`async op failed` with hex status `3` (source) or `83` (destination) means a
+page fault stopped the operation. To fix it, set `block_on_fault=1` on the work
+queue. DTO writes to standard output, or to `<DTO_LOG_FILE>.<program>.<pid>` if
+`DTO_LOG_FILE` is set. It logs only the first three failed completions per
+process, of any status, so a missing message does not rule out a page fault.
+
+On builds with per-operation DSA stats, a failure during normal cache work
+also contributes to the counters for the affected path:
+
+- Copy-out: `copy_out_completion_fallback_ops`.
+- Region flush copy: `navy_bc_flush_copy_completion_fallback_ops`.
+- BlockCache CRC verification: `navy_bc_crc_completion_fallback_ops`.
+- BlockCache copy and CRC: `navy_bc_copy_crc_completion_fallback_ops`.
+
+The counters track each operation Navy redoes on the CPU after a failed DSA
+completion, even after DTO stops logging. They cover all completion failures,
+including page faults, and exist only while offload is enabled for their path.
+Startup probes do not contribute. Refused submissions, such as operations larger
+than the queue's `max_transfer_size`, are counted in `*_submit_fallback_ops`.
+
+BigHash checksum offload is supported but untested and exports no DSA counters.
+If you want to enable DSA in CacheLib, reach out to the CacheLib team.
 
 ## Configure a work queue
 
