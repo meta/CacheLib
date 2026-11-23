@@ -68,7 +68,9 @@ class BlockCache final : public Engine {
     // Minimum value size in bytes for verification offload.
     // 0 uses checksumOffloadMinSize; UINT32_MAX disables verification offload.
     uint32_t checksumOffloadReadMinSize{0};
-    // DSA copy cache hint: enable when CPU reuse is expected.
+    // DSA copy cache hint: enable when CPU reuse is expected; disable when
+    // the next reader is the device's DMA engine
+    // (directFlush/flushCopyOffload).
     bool checksumOffloadCacheControl{true};
     // Base offset and size (in bytes) of cache on the device
     uint64_t cacheBaseOffset{};
@@ -129,6 +131,12 @@ class BlockCache final : public Engine {
     // allocating an intermediate IO buffer and copying. Default false preserves
     // old behavior for safe rollout. When true, avoids redundant copy.
     bool directFlush{false};
+
+    // When not directFlush: copy the region buffer into the flush write
+    // buffer on Intel DSA with one Memory Move descriptor. Requires a DTO
+    // build and DSA work queues configured with block-on-fault (see
+    // cachelib/navy/DSA.md). Verified at runtime, falls back to memcpy.
+    bool flushCopyOffload{false};
 
     // name of this BC instance
     std::string name{};

@@ -24,6 +24,14 @@ namespace facebook {
 namespace cachelib {
 namespace navy {
 
+// How AsyncChecksumOp::wait() waits for the device. kSpinOrYield yields to
+// ready fibers, otherwise pause-polls. kSleep suspends EventBase-backed fibers
+// on a microsecond timer, or sleeps the thread off fibers. Other fiber loop
+// controllers and timer resource failures use the fiber timer's resolution.
+// Wakeups can be delayed by scheduling. kSleep suits latency-insensitive flush
+// copies.
+enum class LargeCopyWait : uint8_t { kSpinOrYield, kSleep };
+
 // Checksum (and fused copy+checksum) helpers that can offload to Intel DSA
 // via the DTO library when built with CACHELIB_BUILD_WITH_DTO. Without DTO
 // support (or when DSA is unavailable at runtime), they run equivalent
@@ -31,13 +39,12 @@ namespace navy {
 // (seed 0, no final inversion), matching
 // checksum(src, ChecksumType::Crc32c).
 
-// A single asynchronous checksum or fused copy+checksum operation.
+// A single asynchronous checksum, fused copy+checksum, or plain copy.
 // submit*() enqueues the operation on DSA and returns immediately (or runs
 // it synchronously on the CPU when offload is unavailable); wait() completes
-// it. While the accelerator works, wait() yields the calling fiber (when
-// running on one, e.g. on a NavyThread) so other requests can execute on
-// this thread — this is what makes the offload truly asynchronous. Off
-// fibers it polls with a CPU pause.
+// it. While the accelerator works, wait() yields or suspends the calling
+// fiber (e.g. on a NavyThread) so other requests can execute on this thread.
+// Off fibers it pause-polls or sleeps according to the wait policy.
 //
 // The object is not copyable or movable: the device holds a pointer into
 // its storage while the operation is in flight. Each submit must be paired
@@ -67,8 +74,13 @@ class AsyncChecksumOp {
   // a bloom filter) but must not be modified until wait() returns.
   void submitChecksum(BufferView src);
 
-  // Completes the operation and returns raw CRC-32C.
-  uint32_t wait();
+  // Plain copy of @src to @dest as a DSA Memory Move (no checksum); wait()
+  // returns 0. Same destination contract as submitCopyAndChecksum.
+  void submitCopy(uint8_t* dest, BufferView src, bool cacheControl);
+
+  // Completes the operation and returns raw CRC-32C (0 for a plain copy).
+  uint32_t wait(LargeCopyWait policy = LargeCopyWait::kSpinOrYield,
+                uint32_t sleepPollUs = 200);
 
   // True iff the most recently waited operation was executed by the
   // accelerator. False when it ran on the CPU: submission refused (DTO size
@@ -79,13 +91,15 @@ class AsyncChecksumOp {
 
  private:
   enum class State : uint8_t { kIdle, kCpuDone, kDsaPending, kWaiting };
-  // What the submitted operation computes: a checksum only or a fused
-  // copy plus checksum.
-  enum class Kind : uint8_t { kCrc, kCopyCrc };
+  // What the submitted operation computes: a checksum only, a fused copy
+  // plus checksum, or a plain copy.
+  enum class Kind : uint8_t { kCrc, kCopyCrc, kCopy };
 
   void submitImpl(Kind kind, uint8_t* dest, BufferView src, bool cacheControl);
   uint32_t computeCpuResult() const;
-  uint32_t waitImpl(bool allowFiberYield);
+  uint32_t waitImpl(bool allowFiberYield,
+                    LargeCopyWait policy = LargeCopyWait::kSpinOrYield,
+                    uint32_t sleepPollUs = 0);
 
   State state_{State::kIdle};
   Kind kind_{Kind::kCrc};
@@ -134,13 +148,36 @@ uint32_t copyAndChecksum(uint8_t* dest,
 uint32_t checksumWithOverlap(BufferView src,
                              folly::FunctionRef<void()> overlap);
 
+// Copies @n bytes from @src to @dest, on DSA when the build has DTO support,
+// the size fits the work queue's transfer limit and submission succeeds,
+// otherwise with memcpy. Returns true iff the accelerator performed the whole
+// copy; an empty copy returns false. The source and destination must not
+// overlap. DSA work queues must be configured with block-on-fault.
+// Yields the calling fiber while the device works, like the checksum ops.
+inline bool copyWithOffload(uint8_t* dest, const uint8_t* src, size_t n) {
+  if (n == 0) {
+    return false;
+  }
+  AsyncChecksumOp op;
+  op.submitCopy(dest, BufferView{n, src}, true);
+  op.wait();
+  return op.completedOnDevice();
+}
+
+// Runtime check that a @size-byte DSA copy completes on the device and is
+// faithful; false when built without DTO or when DSA is unusable. Callers
+// should enable copy offload only if true. DTO does not submit copies larger
+// than the work queue's max_transfer_size and runs them on the CPU instead, so
+// pass the size whose offload you want to confirm: a smaller probe can pass
+// while the caller's copies never reach the device.
+bool copyOffloadSelfCheck(size_t size = 1024 * 1024);
+
 // Diagnostics for checksum waits: cumulative fiber yields and
 // pause-polls across all calls (process-wide).
 struct CopyLargeWaitStats {
   uint64_t yields{0};
   uint64_t polls{0};
-  uint64_t sleeps{0}; // waits that parked the thread (DTO blocking wait or
-                      // nanosleep)
+  uint64_t sleeps{0}; // timed fiber suspensions or blocking thread waits
   uint64_t calls{0};
   uint64_t submitUs{0};  // time in submit (descriptor build + ENQCMD)
   uint64_t waitUs{0};    // time waiting for completion

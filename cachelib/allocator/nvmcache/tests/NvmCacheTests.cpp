@@ -2484,6 +2484,69 @@ TEST_F(NvmCacheTest, testCreateItemAsIOBufChained) {
   }
 }
 
+TEST_F(NvmCacheTest, CopyOutRestoresParentAndChainedPayloads) {
+  for (const auto [enabled, threshold] : {std::pair<bool, uint32_t>{false, 0},
+                                          {true, 0},
+                                          {true, 4096},
+                                          {true, UINT32_MAX}}) {
+    SCOPED_TRACE(fmt::format("enabled={}, threshold={}", enabled, threshold));
+    auto config = *getConfig().nvmConfig;
+    config.copyOutOffload = enabled;
+    config.copyOutOffloadMinSize = threshold;
+    config.truncateItemToOriginalAllocSizeInNvm = true;
+    getConfig().enableNvmCache(config);
+    auto& allocator = makeCache();
+
+    const std::string key = "copy-out-parent";
+    constexpr uint32_t kValueSize = 1031;
+    const auto value = genRandomStr(kValueSize);
+    auto handle = allocator.allocate(poolId(), key, kValueSize);
+    ASSERT_NE(nullptr, handle);
+    std::memcpy(handle->getMemory(), value.data(), value.size());
+    allocator.insertOrReplace(handle);
+    for (uint32_t size : {4095, 4096, 4097}) {
+      auto child = allocator.allocateChainedItem(handle, size);
+      ASSERT_NE(nullptr, child);
+      const auto childValue = genRandomStr(size);
+      std::memcpy(child->getMemory(), childValue.data(), childValue.size());
+      allocator.addChainedItem(handle, std::move(child));
+    }
+
+    auto nvmItem = makeNvmItem(*handle);
+    auto iobuf = createItemAsIOBuf(key, *nvmItem);
+    ASSERT_NE(nullptr, iobuf);
+    verifyItemInIOBuf(key, handle, iobuf.get());
+
+    ASSERT_TRUE(pushToNvmCacheFromRamForTesting(key));
+    allocator.flushNvmCache();
+    handle.reset();
+    removeFromRamForTesting(key);
+    ASSERT_FALSE(checkKeyExists(key, true));
+    auto promoted = fetch(key, false);
+    ASSERT_NE(nullptr, promoted);
+    ASSERT_TRUE(promoted.wentToNvm());
+    ASSERT_TRUE(promoted->isNvmClean());
+    verifyItemInIOBuf(key, promoted, iobuf.get());
+  }
+}
+
+TEST_F(NvmCacheTest, CopyOutWithActiveOffloadCopiesBlobs) {
+  auto config = *getConfig().nvmConfig;
+  config.copyOutOffload = true;
+  config.copyOutOffloadMinSize = 4096;
+  getConfig().enableNvmCache(config);
+  makeCache();
+  // Take the offload branch even when the startup probe finds no DSA.
+  setCopyOutActiveForTesting(true);
+  const auto source = genRandomStr(65536);
+  for (size_t size : {size_t{1}, size_t{4095}, size_t{4096}, source.size()}) {
+    SCOPED_TRACE(size);
+    std::string destination(size, '\0');
+    copyBlobForTesting(destination.data(), source.data(), size);
+    EXPECT_EQ(source.substr(0, size), destination);
+  }
+}
+
 TEST_F(NvmCacheTest, testSampleItem) {
   auto& config = getConfig();
   auto& navyConfig = config.nvmConfig->navyConfig;

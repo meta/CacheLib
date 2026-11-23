@@ -20,6 +20,7 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/Asm.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -30,8 +31,16 @@
 
 #ifdef CACHELIB_BUILD_WITH_DTO
 #include <dto.h>
+#include <folly/Indestructible.h>
+#include <folly/fibers/Baton.h>
+#include <folly/fibers/EventBaseLoopController.h>
+#include <folly/io/async/EventBaseLocal.h>
+#include <folly/io/async/EventHandler.h>
+#include <folly/io/async/TimerFDTimeoutManager.h>
 
 #include <chrono>
+#include <memory>
+#include <thread>
 #endif
 
 namespace facebook {
@@ -78,6 +87,111 @@ unsigned int dtoFlags(bool cacheControl) {
  * before that (a stats read, a test) would otherwise pin "does not block" for
  * the life of the process. The read is a single load. */
 bool dtoWaitBlocks() { return dto_wait_blocks() != 0; }
+
+struct PollWakeup final : folly::TimerFDTimeoutManager::Callback {
+  void timeoutExpired() noexcept override { baton.post(); }
+  void callbackCanceled() noexcept override {}
+
+  folly::fibers::Baton baton;
+};
+
+std::unique_ptr<folly::TimerFDTimeoutManager> makePollTimer(
+    folly::EventBase& eventBase) {
+  auto timer = std::make_unique<folly::TimerFDTimeoutManager>(&eventBase);
+  // The persistent descriptor must not keep an idle event loop alive.
+  if (!timer->isHandlerRegistered() ||
+      !timer->registerInternalHandler(folly::EventHandler::READ |
+                                      folly::EventHandler::PERSIST)) {
+    return nullptr;
+  }
+  return timer;
+}
+
+folly::TimerFDTimeoutManager* getPollTimer(folly::fibers::FiberManager& fm) {
+  auto* controller = dynamic_cast<folly::fibers::EventBaseLoopController*>(
+      &fm.loopController());
+  if (!controller || !controller->getEventBase()) {
+    return nullptr;
+  }
+
+  using TimerPtr = std::unique_ptr<folly::TimerFDTimeoutManager>;
+  static folly::Indestructible<folly::EventBaseLocal<TimerPtr>> timers;
+  auto& eventBase = controller->getEventBase()->getEventBase();
+  const auto& timer = timers->try_emplace_with(
+      eventBase, [&] { return makePollTimer(eventBase); });
+  return timer.get();
+}
+
+void sleepFiber(folly::fibers::FiberManager& fm,
+                std::chrono::microseconds interval) {
+  interval = std::max(interval, std::chrono::microseconds{1});
+  auto* timer = getPollTimer(fm);
+  PollWakeup wakeup;
+  if (timer) {
+    timer->scheduleTimeout(&wakeup, interval);
+  }
+  // Folly's scheduleTimeout() does not expose timerfd_settime() failures.
+  // The Baton timeout wakes the fiber if the timerfd never fires.
+  (void)wakeup.baton.try_wait_for(
+      std::chrono::ceil<std::chrono::milliseconds>(interval) +
+      std::chrono::milliseconds{1});
+  if (timer) {
+    timer->cancelTimeout(&wakeup);
+  }
+}
+
+struct DtoWaitResult {
+  int status;
+  CopyLargeWaitStats stats;
+};
+
+// Destruction drains without yielding or suspending, even if another request
+// is runnable.
+template <typename Poll, typename Wait>
+DtoWaitResult waitForDtoCompletion(Poll poll,
+                                   Wait wait,
+                                   bool allowFiberYield,
+                                   LargeCopyWait policy,
+                                   uint32_t sleepPollUs) {
+  auto* fm = allowFiberYield && folly::fibers::onFiber()
+                 ? folly::fibers::FiberManager::getFiberManagerUnsafe()
+                 : nullptr;
+  const auto interval = std::chrono::microseconds(sleepPollUs);
+  const auto start = std::chrono::steady_clock::now();
+  DtoWaitResult result{};
+  while ((result.status = poll()) == DTO_ASYNC_PENDING) {
+    if (fm && policy == LargeCopyWait::kSleep) {
+      ++result.stats.sleeps;
+      sleepFiber(*fm, interval);
+    } else if (fm && fm->hasReadyTasks()) {
+      ++result.stats.yields;
+      folly::fibers::yield();
+    } else if (dtoWaitBlocks()) {
+      ++result.stats.sleeps;
+      wait();
+    } else if (policy == LargeCopyWait::kSleep) {
+      ++result.stats.sleeps;
+      std::this_thread::sleep_for(interval);
+    } else {
+      ++result.stats.polls;
+      folly::asm_volatile_pause();
+    }
+  }
+  result.stats.calls = 1;
+  result.stats.waitUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+  return result;
+}
+
+void recordChecksumWait(const CopyLargeWaitStats& wait) {
+  auto& stats = checksumCounters();
+  stats.ops.inc();
+  stats.yields.add(wait.yields);
+  stats.polls.add(wait.polls);
+  stats.blocks.add(wait.sleeps);
+  stats.waitUs.add(wait.waitUs);
+}
 } // namespace
 
 static_assert(sizeof(dto_async_op) <= 192,
@@ -105,10 +219,10 @@ AsyncChecksumOp::~AsyncChecksumOp() {
 }
 
 uint32_t AsyncChecksumOp::computeCpuResult() const {
-  if (kind_ == Kind::kCopyCrc && src_.size() != 0) {
+  if (kind_ != Kind::kCrc && src_.size() != 0) {
     std::memcpy(dest_, src_.data(), src_.size());
   }
-  return checksum(src_, ChecksumType::Crc32c);
+  return kind_ == Kind::kCopy ? 0 : checksum(src_, ChecksumType::Crc32c);
 }
 
 void AsyncChecksumOp::submitImpl(Kind kind,
@@ -123,11 +237,21 @@ void AsyncChecksumOp::submitImpl(Kind kind,
 
 #ifdef CACHELIB_BUILD_WITH_DTO
   auto* op = reinterpret_cast<dto_async_op*>(opStorage_);
-  const int rc =
-      kind == Kind::kCopyCrc
-          ? dto_submit_memcpy_crc(op, dest, src.data(), src.size(),
-                                  dtoFlags(cacheControl))
-          : dto_submit_crc(op, src.data(), src.size(), dtoFlags(false));
+  int rc;
+  switch (kind) {
+  case Kind::kCopyCrc:
+    rc = dto_submit_memcpy_crc(op, dest, src.data(), src.size(),
+                               dtoFlags(cacheControl));
+    break;
+  case Kind::kCopy:
+    rc = dto_submit_memcpy(op, dest, src.data(), src.size(),
+                           dtoFlags(cacheControl));
+    break;
+  case Kind::kCrc:
+  default:
+    rc = dto_submit_crc(op, src.data(), src.size(), dtoFlags(false));
+    break;
+  }
   if (rc == DTO_ASYNC_SUBMITTED) {
     state_ = State::kDsaPending;
     return;
@@ -140,9 +264,13 @@ void AsyncChecksumOp::submitImpl(Kind kind,
   state_ = State::kCpuDone;
 }
 
-uint32_t AsyncChecksumOp::wait() { return waitImpl(true); }
+uint32_t AsyncChecksumOp::wait(LargeCopyWait policy, uint32_t sleepPollUs) {
+  return waitImpl(true, policy, sleepPollUs);
+}
 
-uint32_t AsyncChecksumOp::waitImpl(bool allowFiberYield) {
+uint32_t AsyncChecksumOp::waitImpl(bool allowFiberYield,
+                                   LargeCopyWait policy,
+                                   uint32_t sleepPollUs) {
   // NOLINTNEXTLINE(facebook-hte-DetailCall): public logging macro
   XCHECK(state_ == State::kCpuDone || state_ == State::kDsaPending)
       << "wait() requires a submitted operation and a single waiter";
@@ -154,45 +282,28 @@ uint32_t AsyncChecksumOp::waitImpl(bool allowFiberYield) {
 
 #ifdef CACHELIB_BUILD_WITH_DTO
   auto* op = reinterpret_cast<dto_async_op*>(opStorage_);
-  // A normal wait yields only when another fiber is ready. Destruction
-  // drains without yielding, even if another request is runnable.
-  auto* fm = allowFiberYield && folly::fibers::onFiber()
-                 ? folly::fibers::FiberManager::getFiberManagerUnsafe()
-                 : nullptr;
-  int rc;
-  const auto t0 = std::chrono::steady_clock::now();
-  uint64_t yields = 0, polls = 0, blocks = 0;
-  while ((rc = dto_async_poll(op)) == DTO_ASYNC_PENDING) {
-    if (fm && fm->hasReadyTasks()) {
-      ++yields;
-      folly::fibers::yield();
-    } else if (dtoWaitBlocks()) {
-      ++blocks;
-      dto_async_wait(op);
-    } else {
-      ++polls;
-      folly::asm_volatile_pause();
-    }
+  const auto result = waitForDtoCompletion(
+      [&] { return dto_async_poll(op); }, [&] { dto_async_wait(op); },
+      allowFiberYield, policy, sleepPollUs);
+  // The checksum counters describe checksum operations only.
+  const bool checksumOp = kind_ != Kind::kCopy;
+  if (checksumOp) {
+    recordChecksumWait(result.stats);
   }
-  auto& stats = checksumCounters();
-  stats.blocks.add(blocks);
-  stats.ops.inc();
-  stats.yields.add(yields);
-  stats.polls.add(polls);
-  stats.waitUs.add(std::chrono::duration_cast<std::chrono::microseconds>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count());
-  if (rc == DTO_ASYNC_DONE) {
-    onDevice_ = true;
-    crc_ = dto_async_crc_val(op);
+  onDevice_ = result.status == DTO_ASYNC_DONE;
+  if (onDevice_) {
+    crc_ = checksumOp ? dto_async_crc_val(op) : 0;
   } else {
     // Failed copies may be partial; redo them before exposing the destination.
-    onDevice_ = false;
-    stats.fallbacks.inc();
+    if (checksumOp) {
+      checksumCounters().fallbacks.inc();
+    }
     crc_ = computeCpuResult();
   }
 #else
   (void)allowFiberYield;
+  (void)policy;
+  (void)sleepPollUs;
   // NOLINTNEXTLINE(facebook-hte-DetailCall): public logging macro
   XLOG(FATAL) << "A non-DTO AsyncChecksumOp cannot have device work pending";
 #endif
@@ -212,6 +323,16 @@ void AsyncChecksumOp::submitCopyAndChecksum(uint8_t* dest,
 
 void AsyncChecksumOp::submitChecksum(BufferView src) {
   submitImpl(Kind::kCrc, nullptr, src, false);
+}
+
+void AsyncChecksumOp::submitCopy(uint8_t* dest,
+                                 BufferView src,
+                                 bool cacheControl) {
+  XDCHECK(dest);
+  // NOLINTNEXTLINE(facebook-hte-DetailCall): public logging macro
+  XDCHECK(copyRangesDoNotOverlap(dest, src))
+      << "copy source and destination must not overlap";
+  submitImpl(Kind::kCopy, dest, src, cacheControl);
 }
 
 CopyLargeWaitStats getChecksumWaitStats() {
@@ -297,6 +418,33 @@ bool checksumOffloadSelfCheck() {
   if (std::memcmp(dst.data(), src.data(), kSize) != 0) {
     // NOLINTNEXTLINE(facebook-hte-DetailCall): public logging macro
     XLOG(WARN) << "checksumOffloadSelfCheck: fused copy is not faithful";
+    return false;
+  }
+  return true;
+}
+
+bool copyOffloadSelfCheck(size_t size) {
+  if (!checksumOffloadSupported()) {
+    return false;
+  }
+  const size_t probeSize = std::max<size_t>(size, 4096);
+  std::vector<uint8_t> src(probeSize);
+  std::vector<uint8_t> dst(probeSize, 0);
+  std::mt19937 gen{54321};
+  for (auto& b : src) {
+    b = static_cast<uint8_t>(gen());
+  }
+  AsyncChecksumOp op;
+  op.submitCopy(dst.data(), BufferView{probeSize, src.data()}, true);
+  op.wait();
+  if (!op.completedOnDevice() ||
+      std::memcmp(dst.data(), src.data(), probeSize) != 0) {
+    // NOLINTNEXTLINE(facebook-hte-DetailCall): public logging macro
+    XLOGF(WARN,
+          "copyOffloadSelfCheck: a {}-byte DSA Memory Move did not complete on "
+          "the device or did not verify; check block_on_fault and "
+          "max_transfer_size in the work queue configuration",
+          probeSize);
     return false;
   }
   return true;

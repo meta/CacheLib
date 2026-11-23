@@ -213,6 +213,14 @@ class NvmCacheTest : public testing::Test {
   }
 
  protected:
+  void setCopyOutActiveForTesting(bool active) {
+    getNvmCache()->copyOutOffload_ = active;
+  }
+
+  void copyBlobForTesting(void* dest, const void* src, size_t size) {
+    getNvmCache()->copyBlobData(dest, src, size);
+  }
+
   // Helper for ShardHashIsNotFillMapHash because we're the friend of NvmCache.
   std::pair<size_t, size_t> getNvmShardAndHashForKey(folly::StringPiece key) {
     auto nvm = getNvmCache();

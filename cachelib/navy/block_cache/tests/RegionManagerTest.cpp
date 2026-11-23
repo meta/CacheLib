@@ -28,12 +28,31 @@
 #include "cachelib/navy/testing/SeqPoints.h"
 
 namespace facebook::cachelib::navy::tests {
+class RegionManagerTestPeer {
+ public:
+  // Exercise the copy helper even when the runtime probe cannot find DSA.
+  static void enableCopyOffload(RegionManager& rm) {
+    rm.flushCopyOffload_ = true;
+  }
+};
+
 namespace {
 const Region kRegion0{RegionId{0}, 100};
 const Region kRegion1{RegionId{1}, 100};
 const Region kRegion2{RegionId{2}, 100};
 const Region kRegion3{RegionId{3}, 100};
 constexpr uint16_t kFlushRetryLimit = 10;
+
+double getRegionManagerCounter(const RegionManager& rm,
+                               folly::StringPiece counterName) {
+  double result = -1;
+  rm.getCounters({[&](folly::StringPiece name, double value) {
+    if (name == counterName) {
+      result = value;
+    }
+  }});
+  return result;
+}
 } // namespace
 
 TEST(RegionManager, ReclaimLruAsFifo) {
@@ -170,7 +189,10 @@ TEST(RegionManager, Recovery) {
   }
 }
 
-TEST(RegionManager, ReadWrite) {
+namespace {
+void testReadWrite(bool directFlush,
+                   bool flushCopyOffload,
+                   bool forceCopyOffloadForTest = false) {
   constexpr uint64_t kBaseOffset = 1024;
   constexpr uint32_t kNumRegions = 4;
   constexpr uint32_t kRegionSize = 4 * 1024;
@@ -184,7 +206,11 @@ TEST(RegionManager, ReadWrite) {
       kNumRegions, kRegionSize, kBaseOffset, *device, 1, 1, 0,
       std::move(evictCb), std::move(cleanupCb), std::make_unique<LruPolicy>(4),
       kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
-      true /* workerFlushAsync */);
+      true /* workerFlushAsync */, false /* allowReadDuringReclaim */,
+      false /* recoverEvictionPolicy */, directFlush, flushCopyOffload);
+  if (forceCopyOffloadForTest) {
+    RegionManagerTestPeer::enableCopyOffload(*rm);
+  }
 
   ENABLE_INJECT_PAUSE_IN_SCOPE();
 
@@ -212,10 +238,12 @@ TEST(RegionManager, ReadWrite) {
   auto buf = bg.gen(kSize);
   auto wAddr = RelAddress{rid, kLocalOffset};
   buf.view().copyTo(allocView.data() + kLocalOffset);
-  auto rDesc = rm->openForRead(rid, 1);
+  auto rDesc = rm->openForRead(rid, rm->getSeqNumber());
+  ASSERT_EQ(OpenStatus::Ready, rDesc.status());
   auto bufRead = rm->read(rDesc, wAddr, kSize);
   EXPECT_TRUE(bufRead.size() == kSize);
   EXPECT_EQ(buf.view(), bufRead.view());
+  region.close(std::move(rDesc));
 
   // flush buffer
   region.close(std::move(wDesc));
@@ -225,6 +253,76 @@ TEST(RegionManager, ReadWrite) {
   Buffer bufReadDirect{kSize};
   EXPECT_TRUE(devicePtr->read(expectedOfs, kSize, bufReadDirect.data()));
   EXPECT_EQ(buf.view(), bufReadDirect.view());
+}
+} // namespace
+
+TEST(RegionManager, ReadWrite) {
+  testReadWrite(false /* directFlush */, false /* flushCopyOffload */);
+}
+
+TEST(RegionManager, ReadWriteCopyOffload) {
+  for (bool directFlush : {false, true}) {
+    SCOPED_TRACE(directFlush);
+    testReadWrite(directFlush, true /* flushCopyOffload */);
+  }
+}
+
+TEST(RegionManager, ReadWriteWithActiveCopyOffload) {
+  testReadWrite(false /* directFlush */, true /* flushCopyOffload */,
+                true /* forceCopyOffloadForTest */);
+}
+
+TEST(RegionManager, CopyOffloadWriteFailureAndRetry) {
+  constexpr uint32_t kNumRegions = 2;
+  constexpr uint32_t kRegionSize = 4 * 1024;
+  testing::NiceMock<MockDevice> device(kNumRegions * kRegionSize, 1024);
+  RegionManager rm(
+      kNumRegions, kRegionSize, 0, device, 1, 1, 0,
+      [](RegionId, BufferView) { return 0; }, [](RegionId, BufferView) {},
+      std::make_unique<LruPolicy>(kNumRegions), 1 /* numInMemBuffers */, 0,
+      kFlushRetryLimit, true /* workerFlushAsync */,
+      false /* allowReadDuringReclaim */, false /* recoverEvictionPolicy */,
+      false /* directFlush */, true /* flushCopyOffload */);
+  RegionManagerTestPeer::enableCopyOffload(rm);
+
+  BufferGen bg;
+  std::vector<Buffer> expected;
+  expected.push_back(bg.gen(kRegionSize));
+  expected.push_back(bg.gen(kRegionSize));
+  uint32_t writes = 0;
+  EXPECT_CALL(device, writeImpl(testing::_, testing::_, testing::_, testing::_))
+      .Times(3)
+      .WillRepeatedly(
+          [&](uint64_t offset, uint32_t size, const void* data, int) {
+            EXPECT_EQ(kRegionSize, size);
+            const BufferView view{size, static_cast<const uint8_t*>(data)};
+            EXPECT_EQ(expected.at(offset / kRegionSize).view(), view);
+            if (++writes == 1) {
+              return false;
+            }
+            return device.getRealDeviceRef().write(offset, view);
+          });
+
+  for (uint32_t i = 0; i < kNumRegions; ++i) {
+    SCOPED_TRACE(i);
+    const RegionId rid{i};
+    auto [buffer, waiter] = rm.claimBufferFromPool(false /* addWaiter */);
+    ASSERT_NE(nullptr, buffer);
+    auto& region = rm.getRegion(rid);
+    region.attachBuffer(std::move(buffer));
+    auto [desc, addr, view] = region.openAndAllocate(kRegionSize);
+    ASSERT_EQ(OpenStatus::Ready, desc.status());
+    expected[i].view().copyTo(view.data());
+    region.close(std::move(desc));
+
+    rm.doFlush(rid, false /* async */);
+    EXPECT_FALSE(region.hasBuffer());
+    auto stored = device.getRealDeviceRef().read(i * kRegionSize, kRegionSize);
+    EXPECT_EQ(expected[i].view(), stored.view());
+  }
+
+  ASSERT_EQ(3, writes);
+  EXPECT_EQ(1, getRegionManagerCounter(rm, "navy_bc_inmem_flush_retries"));
 }
 
 TEST(RegionManager, RecoveryLRUOrder) {

@@ -271,7 +271,8 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
                      config.regionManagerFlushAsync,
                      true /* allowReadDuringReclaim */,
                      config.recoverEvictionPolicy,
-                     config.directFlush},
+                     config.directFlush,
+                     config.flushCopyOffload},
       allocator_{regionManager_, config.allocatorsPerPriority},
       reinsertionPolicy_{makeReinsertionPolicy(config.reinsertionConfig)} {
   validate(config);

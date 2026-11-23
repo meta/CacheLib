@@ -40,6 +40,9 @@ class FlashCacheComponent;
 }
 
 namespace navy {
+namespace tests {
+class RegionManagerTestPeer;
+}
 using folly::fibers::TimedMutex;
 using CondWaiter = util::ConditionVariable::Waiter;
 
@@ -91,6 +94,12 @@ class RegionManager {
   //                                  policy ordering across restarts
   // @param directFlush               whether to write region buffer directly
   //                                  to device without intermediate copy
+  // @param flushCopyOffload          when not directFlush: copy the region
+  //                                  buffer into the write buffer on Intel DSA
+  //                                  (one Memory Move descriptor), with CPU
+  //                                  fallback if offload is unavailable. DSA
+  //                                  work queues require block-on-fault;
+  //                                  see cachelib/navy/DSA.md.
   RegionManager(uint32_t numRegions,
                 uint64_t regionSize,
                 uint64_t baseOffset,
@@ -107,7 +116,8 @@ class RegionManager {
                 bool workerFlushAsync,
                 bool allowReadDuringReclaim = false,
                 bool recoverEvictionPolicy = false,
-                bool directFlush = false);
+                bool directFlush = false,
+                bool flushCopyOffload = false);
   RegionManager(const RegionManager&) = delete;
   RegionManager& operator=(const RegionManager&) = delete;
 
@@ -382,6 +392,9 @@ class RegionManager {
   // Whether to write region buffer directly without intermediate copy
   const bool directFlush_{false};
 
+  // Cleared at construction for direct flush or a failed self-check.
+  bool flushCopyOffload_{false};
+
   const RegionEvictCallback evictCb_;
   const RegionCleanupCallback cleanupCb_;
 
@@ -409,6 +422,7 @@ class RegionManager {
   int placementHandle_;
 
   friend class interface::FlashCacheComponent;
+  friend class tests::RegionManagerTestPeer;
 };
 } // namespace navy
 } // namespace cachelib

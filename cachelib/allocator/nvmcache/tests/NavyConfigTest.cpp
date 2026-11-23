@@ -147,6 +147,7 @@ TEST(NavyConfigTest, DefaultVal) {
   EXPECT_TRUE(blockCacheConfig.getSFifoSegmentRatio().empty());
   EXPECT_EQ(blockCacheConfig.getDataChecksum(), true);
   EXPECT_EQ(blockCacheConfig.getNumInMemBuffers(), 2);
+  EXPECT_FALSE(blockCacheConfig.isFlushCopyOffload());
 
   const auto& bigHashConfig = config.bigHash();
   EXPECT_EQ(bigHashConfig.getBucketSize(), 4096);
@@ -207,6 +208,7 @@ TEST(NavyConfigTest, Serialization) {
   expectedConfigMap["navyConfig::blockCacheReinsertionPctThreshold"] = "0";
   expectedConfigMap["navyConfig::blockCacheNumInMemBuffers"] = "8";
   expectedConfigMap["navyConfig::blockCacheDataChecksum"] = "true";
+  expectedConfigMap["navyConfig::blockCacheFlushCopyOffload"] = "false";
   expectedConfigMap["navyConfig::blockCacheSegmentedFifoSegmentRatio"] =
       "111,222,333";
 
@@ -226,6 +228,26 @@ TEST(NavyConfigTest, Serialization) {
   expectedConfigMap["navyConfig::stackSize"] = "0";
 
   EXPECT_EQ(configMap, expectedConfigMap);
+}
+
+TEST(NavyConfigTest, FlushCopyOffloadConfiguration) {
+  NavyConfig config;
+  for (bool enabled : {true, false}) {
+    SCOPED_TRACE(enabled);
+    config.blockCache().setFlushCopyOffload(enabled);
+    EXPECT_EQ(enabled, config.blockCache().isFlushCopyOffload());
+    EXPECT_EQ(enabled ? "true" : "false",
+              config.serialize().at("navyConfig::blockCacheFlushCopyOffload"));
+  }
+}
+
+TEST(NavyConfigTest, FlushCopyOffloadPerEngineSerialization) {
+  NavyConfig config;
+  config.blockCache().setFlushCopyOffload(true);
+  config.addEnginePair(navy::EnginesConfig{});
+  const auto serialized = config.serialize();
+  EXPECT_EQ("true", serialized.at("navyConfig::blockCacheFlushCopyOffload_0"));
+  EXPECT_EQ("false", serialized.at("navyConfig::blockCacheFlushCopyOffload_1"));
 }
 
 TEST(NavyConfigTest, AdmissionPolicy) {

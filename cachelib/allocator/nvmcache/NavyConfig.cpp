@@ -325,6 +325,8 @@ std::map<std::string, std::string> EnginesConfig::serialize() const {
       folly::to<std::string>(blockCache().getNumInMemBuffers());
   configMap["navyConfig::blockCacheDataChecksum"] =
       blockCache().getDataChecksum() ? "true" : "false";
+  configMap["navyConfig::blockCacheFlushCopyOffload"] =
+      blockCache().isFlushCopyOffload() ? "true" : "false";
   configMap["navyConfig::blockCacheSegmentedFifoSegmentRatio"] =
       folly::join(",", blockCache().getSFifoSegmentRatio());
 

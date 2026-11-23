@@ -141,6 +141,10 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
 
   void setDirectFlush(bool enable) override { config_.directFlush = enable; }
 
+  void setFlushCopyOffload(bool enable) override {
+    config_.flushCopyOffload = enable;
+  }
+
   void setUseCombinedEntryBlock(bool useCombinedEntryBlock) override {
     config_.useCombinedEntryBlock = useCombinedEntryBlock;
   }

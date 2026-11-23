@@ -47,6 +47,7 @@
 #include "cachelib/common/Profiled.h"
 #include "cachelib/common/Time.h"
 #include "cachelib/common/Utils.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Device.h"
 #include "cachelib/navy/common/Types.h"
 #include "folly/Range.h"
@@ -159,6 +160,15 @@ class NvmCache {
     // real error). Leaving this option here for now, since it could be useful
     // in the future.
     bool disableNvmCacheOnBadState{true};
+
+    // Offload the flash-hit copy-out (Navy read buffer -> DRAM item) to Intel
+    // DSA through the DTO library for blobs of at least copyOutOffloadMinSize
+    // bytes. Requires CacheLib built with BUILD_WITH_DTO; verified at
+    // construction and silently falls back to memcpy when DSA is unusable.
+    // DSA work queues must be configured with block-on-fault enabled; see
+    // cachelib/navy/DSA.md.
+    bool copyOutOffload{false};
+    uint32_t copyOutOffloadMinSize{65536};
 
     // serialize the config for debugging purposes
     std::map<std::string, std::string> serialize() const;
@@ -384,6 +394,11 @@ class NvmCache {
   //          based on the NvmItem
   WriteHandle createItem(folly::StringPiece key, const NvmItem& nvmItem);
 
+  // Copies a blob's payload into freshly allocated item memory, on DSA when
+  // copy-out offload is active and the blob is large enough (see
+  // Config::copyOutOffload), otherwise with memcpy.
+  void copyBlobData(void* dest, const void* src, size_t n);
+
   // creates the item into IOBuf from NvmItem, if the item has chained items,
   // chained IOBufs will be created.
   // @param key   key for the dipper item
@@ -566,6 +581,9 @@ class NvmCache {
   }
 
   const Config config_;
+
+  // Whether the DSA copy-out offload passed its runtime self-check.
+  bool copyOutOffload_{false};
   C& cache_;                            //< cache allocator
   std::atomic<bool> navyEnabled_{true}; //< switch to turn off/on navy
 
@@ -646,6 +664,8 @@ std::map<std::string, std::string> NvmCache<C>::Config::serialize() const {
       truncateItemToOriginalAllocSizeInNvm ? "true" : "false";
   configMap["disableNvmCacheOnBadState"] =
       disableNvmCacheOnBadState ? "true" : "false";
+  configMap["copyOutOffload"] = copyOutOffload ? "true" : "false";
+  configMap["copyOutOffloadMinSize"] = std::to_string(copyOutOffloadMinSize);
   return configMap;
 }
 
@@ -1130,6 +1150,19 @@ NvmCache<C>::NvmCache(C& c,
       itemDestructor_ ? true : false,
       navyPersistParams);
 
+  if (config_.copyOutOffload) {
+    copyOutOffload_ = navy::copyOffloadSelfCheck();
+    if (copyOutOffload_) {
+      XLOGF(INFO,
+            "NvmCache: DSA copy-out offload active for blobs >= {} bytes",
+            config_.copyOutOffloadMinSize);
+    } else {
+      XLOG(WARN) << "NvmCache: DSA copy-out offload requested but the DTO/DSA "
+                    "self-check failed (not built with DTO, or DSA "
+                    "unavailable); falling back to memcpy";
+    }
+  }
+
   if (accessTimeMap_ && shmManager_) {
     try {
       accessTimeMap_->recover(*shmManager_);
@@ -1484,7 +1517,7 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::createItem(
   } else {
     XDCHECK_LE(pBlob.data.size(), getStorageSizeInNvm(*it));
     XDCHECK_LE(pBlob.origAllocSize, pBlob.data.size());
-    ::memcpy(it->getMemory(), pBlob.data.data(), pBlob.data.size());
+    copyBlobData(it->getMemory(), pBlob.data.data(), pBlob.data.size());
     it->markNvmClean();
     if (isNvmItemLarge(key, nvmItem)) {
       it->markNvmLargeItem();
@@ -1508,7 +1541,8 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::createItem(
         }
         XDCHECK(chainedIt->isChainedItem());
         XDCHECK_LE(cBlob.data.size(), getStorageSizeInNvm(*chainedIt));
-        ::memcpy(chainedIt->getMemory(), cBlob.data.data(), cBlob.data.size());
+        copyBlobData(chainedIt->getMemory(), cBlob.data.data(),
+                     cBlob.data.size());
         cache_.addChainedItem(it, std::move(chainedIt));
         XDCHECK(it->hasChainedItem());
       }
@@ -1521,6 +1555,19 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::createItem(
         *it, CacheAPIWrapperForNvm<C>::viewAsChainedAllocsRange(cache_, *it)});
   }
   return it;
+}
+
+template <typename C>
+void NvmCache<C>::copyBlobData(void* dest, const void* src, size_t n) {
+  if (n == 0) {
+    return;
+  }
+  if (copyOutOffload_ && n >= config_.copyOutOffloadMinSize) {
+    navy::copyWithOffload(reinterpret_cast<uint8_t*>(dest),
+                          reinterpret_cast<const uint8_t*>(src), n);
+  } else {
+    ::memcpy(dest, src, n);
+  }
 }
 
 template <typename C>
@@ -1558,7 +1605,7 @@ std::unique_ptr<folly::IOBuf> NvmCache<C>::createItemAsIOBuf(
   XDCHECK_LE(pBlob.origAllocSize, pBlob.data.size());
 
   if (!useCustomCb) {
-    ::memcpy(item->getMemory(), pBlob.data.data(), pBlob.data.size());
+    copyBlobData(item->getMemory(), pBlob.data.data(), pBlob.data.size());
   }
 
   item->markNvmClean();
@@ -1592,8 +1639,8 @@ std::unique_ptr<folly::IOBuf> NvmCache<C>::createItemAsIOBuf(
       // Propagate the payload directly from Blob only if no customized callback
       // is set.
       if (!useCustomCb) {
-        ::memcpy(chainedItem->getMemory(), cBlob.data.data(),
-                 cBlob.origAllocSize);
+        copyBlobData(chainedItem->getMemory(), cBlob.data.data(),
+                     cBlob.origAllocSize);
       }
       head->appendChain(std::move(chained));
       item->markHasChainedItem();

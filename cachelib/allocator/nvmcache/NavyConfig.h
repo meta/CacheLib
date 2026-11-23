@@ -563,6 +563,13 @@ class BlockCacheConfig {
     return *this;
   }
 
+  // Requires DTO/DSA support and a successful runtime probe; directFlush
+  // bypasses the intermediate copy. See cachelib/navy/DSA.md for host setup.
+  BlockCacheConfig& setFlushCopyOffload(bool enable) noexcept {
+    flushCopyOffload_ = enable;
+    return *this;
+  }
+
   BlockCacheConfig& setAllocatorCount(uint32_t numAllocators) noexcept {
     allocatorsPerPriority_ = {numAllocators};
     return *this;
@@ -627,6 +634,8 @@ class BlockCacheConfig {
 
   bool isDirectFlush() const { return directFlush_; }
 
+  bool isFlushCopyOffload() const { return flushCopyOffload_; }
+
   bool isCombinedEntryBlockEnabled() const { return useCombinedEntryBlock_; }
 
   const BlockCacheReinsertionConfig& getReinsertionConfig() const {
@@ -678,6 +687,8 @@ class BlockCacheConfig {
 
   // Whether to write region buffer directly without intermediate copy.
   bool directFlush_{false};
+
+  bool flushCopyOffload_{false};
 
   // Whether to use Combined entry block (For index entries and small sized
   // items).

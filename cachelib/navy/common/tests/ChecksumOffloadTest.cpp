@@ -36,11 +36,81 @@ std::vector<uint8_t> randomBytes(size_t size, uint32_t seed) {
   }
   return bytes;
 }
+
+void expectChecksumStatsUnchanged(const CopyLargeWaitStats& before,
+                                  const CopyLargeWaitStats& after) {
+  EXPECT_EQ(before.calls, after.calls);
+  EXPECT_EQ(before.fallbacks, after.fallbacks);
+  EXPECT_EQ(before.yields, after.yields);
+  EXPECT_EQ(before.polls, after.polls);
+  EXPECT_EQ(before.sleeps, after.sleeps);
+  EXPECT_EQ(before.waitUs, after.waitUs);
+}
 } // namespace
 
 // Sizes from a few bytes to 1 MiB. These checks apply both without DTO
 // support and when a DTO build uses DSA or its CPU fallbacks.
 const size_t kSizes[] = {1, 13, 175, 4096, 16 * 1024, 64 * 1024, 1024 * 1024};
+
+TEST(ChecksumOffload, PlainCopyMatchesSoftware) {
+  uint32_t seed = 500;
+  for (auto size : kSizes) {
+    SCOPED_TRACE(size);
+    const auto src = randomBytes(size, seed++);
+    std::vector<uint8_t> dst(size, 0xAA);
+    const bool onDevice = copyWithOffload(dst.data(), src.data(), size);
+    EXPECT_EQ(0, std::memcmp(src.data(), dst.data(), size));
+    if (!checksumOffloadSupported()) {
+      EXPECT_FALSE(onDevice);
+    }
+  }
+}
+
+TEST(ChecksumOffload, PlainCopyOpIsReusable) {
+  const size_t size = 64 * 1024;
+  AsyncChecksumOp op;
+  for (uint32_t seed : {501u, 502u}) {
+    SCOPED_TRACE(seed);
+    const auto src = randomBytes(size, seed);
+    const BufferView view{src.size(), src.data()};
+    std::vector<uint8_t> dst(size, 0xAA);
+    // Reuse an object that just computed a checksum: a plain copy returns
+    // zero and does not count as checksum work.
+    op.submitChecksum(view);
+    EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
+    const auto checksumBefore = getChecksumWaitStats();
+    op.submitCopy(dst.data(), view, true /* cacheControl */);
+    EXPECT_EQ(0u, op.wait());
+    EXPECT_EQ(0, std::memcmp(src.data(), dst.data(), size));
+    expectChecksumStatsUnchanged(checksumBefore, getChecksumWaitStats());
+    if (!checksumOffloadSupported()) {
+      EXPECT_FALSE(op.completedOnDevice());
+    }
+  }
+}
+
+TEST(ChecksumOffload, SleepWaitCopiesFaithfully) {
+  const auto src = randomBytes(1024 * 1024, 503);
+  std::vector<uint8_t> dst(src.size(), 0);
+  AsyncChecksumOp op;
+  op.submitCopy(dst.data(), BufferView{src.size(), src.data()},
+                false /* cacheControl */);
+  EXPECT_EQ(0u, op.wait(LargeCopyWait::kSleep, 50 /* us */));
+  EXPECT_EQ(0, std::memcmp(src.data(), dst.data(), src.size()));
+}
+
+TEST(ChecksumOffload, EmptyCopiesDoNotReportDeviceWork) {
+  const uint8_t src = 0x5A;
+  uint8_t dst = 0xA5;
+  const auto checksumBefore = getChecksumWaitStats();
+  EXPECT_FALSE(copyWithOffload(&dst, &src, 0));
+  AsyncChecksumOp op;
+  op.submitCopy(&dst, BufferView{0, &src}, true /* cacheControl */);
+  EXPECT_EQ(0u, op.wait());
+  EXPECT_FALSE(op.completedOnDevice());
+  EXPECT_EQ(0xA5, dst);
+  expectChecksumStatsUnchanged(checksumBefore, getChecksumWaitStats());
+}
 
 TEST(ChecksumOffload, CopyAndChecksumMatchesSoftware) {
   uint32_t seed = 1;
@@ -171,6 +241,7 @@ TEST(ChecksumOffload, AsyncOpDrainOnDestroy) {
 TEST(ChecksumOffload, SelfCheck) {
   if (!checksumOffloadSupported()) {
     EXPECT_FALSE(checksumOffloadSelfCheck());
+    EXPECT_FALSE(copyOffloadSelfCheck());
     return;
   }
   // Built with DTO. The self-check now requires the accelerator to actually
@@ -186,6 +257,7 @@ TEST(ChecksumOffload, SelfCheck) {
     GTEST_SKIP() << "built with DTO but no usable DSA work queue on this host";
   }
   EXPECT_TRUE(checksumOffloadSelfCheck());
+  EXPECT_TRUE(copyOffloadSelfCheck());
 }
 
 TEST(ChecksumOffload, CompletedOnDeviceIsTruthful) {

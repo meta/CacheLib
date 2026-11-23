@@ -101,6 +101,9 @@ class BlockCacheProto {
   // (Optional) Set if direct flush without intermediate copy is enabled.
   virtual void setDirectFlush(bool enable) = 0;
 
+  // (Optional) Offload the intermediate region-flush copy to DSA.
+  virtual void setFlushCopyOffload(bool enable) = 0;
+
   // (Optional) Set if the combined entry block is enabled.
   virtual void setUseCombinedEntryBlock(bool useCombinedEntryBlock) = 0;
 

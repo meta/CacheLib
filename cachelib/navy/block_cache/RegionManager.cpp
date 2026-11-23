@@ -16,8 +16,11 @@
 
 #include "cachelib/navy/block_cache/RegionManager.h"
 
+#include <utility>
+
 #include "cachelib/common/Profiled.h"
 #include "cachelib/common/inject_pause.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Utils.h"
 
 namespace facebook::cachelib::navy {
@@ -37,7 +40,8 @@ RegionManager::RegionManager(uint32_t numRegions,
                              bool workerFlushAsync,
                              bool allowReadDuringReclaim,
                              bool recoverEvictionPolicy,
-                             bool directFlush)
+                             bool directFlush,
+                             bool flushCopyOffload)
     : numPriorities_{numPriorities},
       inMemBufFlushRetryLimit_{inMemBufFlushRetryLimit},
       numRegions_{numRegions},
@@ -51,13 +55,28 @@ RegionManager::RegionManager(uint32_t numRegions,
       allowReadDuringReclaim_(allowReadDuringReclaim),
       recoverEvictionPolicy_{recoverEvictionPolicy},
       directFlush_{directFlush},
-      evictCb_{evictCb},
-      cleanupCb_{cleanupCb},
+      flushCopyOffload_{flushCopyOffload},
+      evictCb_{std::move(evictCb)},
+      cleanupCb_{std::move(cleanupCb)},
       numInMemBuffers_{numInMemBuffers},
       placementHandle_{device_.allocatePlacementHandle()} {
   XLOGF(INFO,
         "{} regions, {} bytes each, allowReadDuringReclaim {}, directFlush {}",
         numRegions_, regionSize_, allowReadDuringReclaim, directFlush);
+  if (flushCopyOffload_ && directFlush_) {
+    XLOG(INFO) << "RegionManager: directFlush set, flush copy offload is moot";
+    flushCopyOffload_ = false;
+  }
+  if (flushCopyOffload_) {
+    // probe at the size the flush will actually submit
+    flushCopyOffload_ = copyOffloadSelfCheck(regionSize_);
+    if (flushCopyOffload_) {
+      XLOG(INFO) << "RegionManager: flush copy offload to DSA active";
+    } else {
+      XLOG(WARN) << "RegionManager: flush copy offload requested but the "
+                    "DTO/DSA self-check failed; using memcpy";
+    }
+  }
   for (uint32_t i = 0; i < numRegions; i++) {
     regions_[i] = std::make_unique<Region>(RegionId{i}, regionSize_);
   }
@@ -139,7 +158,16 @@ Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
       }
     } else {
       auto writeBuffer = device_.makeIOBuffer(view.size());
-      writeBuffer.copyFrom(0, view);
+      if (flushCopyOffload_) {
+        // One Memory Move descriptor. Disable cache control because the
+        // storage device reads the destination next, and sleep between polls
+        // when the flush fiber has no runnable work.
+        AsyncChecksumOp op;
+        op.submitCopy(writeBuffer.data(), view, false /* cacheControl */);
+        op.wait(LargeCopyWait::kSleep, 200 /* us */);
+      } else {
+        writeBuffer.copyFrom(0, view);
+      }
       if (!deviceWrite(addr, std::move(writeBuffer))) {
         return false;
       }
