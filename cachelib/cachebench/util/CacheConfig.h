@@ -271,6 +271,10 @@ struct CacheConfig : public JSONConfig {
   // maximum pending inserts before rejecting new inserts.
   uint32_t navyMaxConcurrentInserts{1000000};
 
+  // number of NvmCache shards for its per-key bookkeeping (fill, put, delete
+  // and tombstone maps). 0 uses the NavyConfig default.
+  uint32_t navyNumShards{0};
+
   // enables data checksuming for navy. metadata checksum is enabled by
   // default
   bool navyDataChecksum{true};

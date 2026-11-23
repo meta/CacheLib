@@ -967,6 +967,9 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     }
     nvmConfig.navyConfig.setMaxConcurrentInserts(
         config_.navyMaxConcurrentInserts);
+    if (config_.navyNumShards > 0) {
+      nvmConfig.navyConfig.setNumShards(config_.navyNumShards);
+    }
     nvmConfig.navyConfig.setEnableAccessTimeMap(
         config_.navyEnableAccessTimeMap);
     nvmConfig.navyConfig.setAccessTimeMapMaxSize(
