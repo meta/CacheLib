@@ -99,14 +99,16 @@ class InFlightTransfers {
 
   class LookupWaiter {
    public:
+    ~LookupWaiter() = default;
     LookupWaiter(const LookupWaiter&) = default;
     LookupWaiter& operator=(const LookupWaiter&) = default;
     LookupWaiter(LookupWaiter&&) noexcept = default;
     LookupWaiter& operator=(LookupWaiter&&) noexcept = default;
 
-    // Captures the context immediately. The task ignores caller cancellation
-    // and can outlive this waiter and the registry. The returned shared result
-    // keeps a hit pinned. Only call on a non-moved-from waiter.
+    // Waits for this lookup to finish with a shared hit, miss, or error.
+    // Caller cancellation does not stop the wait. The returned task can outlive
+    // the waiter and registry, and retaining a hit result keeps the item
+    // pinned. Do not call on a moved-from waiter.
     folly::coro::Task<SharedLookupResult> wait() const;
 
    private:
@@ -125,7 +127,9 @@ class InFlightTransfers {
     LookupOwner(LookupOwner&&) noexcept = default;
     LookupOwner& operator=(LookupOwner&& other) noexcept;
 
-    // Completes once; returns false if already completed or moved from.
+    // Publishes a hit, miss, or error to all waiters and lets a new lookup
+    // start for this key. Returns false if this owner is empty, moved from,
+    // or already completed.
     // A hit must contain an ingress handle for this key. Its component must
     // outlive every waiter, task, and shared result retaining that handle.
     // Destruction or replacement of an unfinished owner completes with a miss.

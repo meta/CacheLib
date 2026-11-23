@@ -83,6 +83,7 @@ struct InFlightTransfers::Registration {
 struct InFlightTransfers::GetCtx {
   explicit GetCtx(std::shared_ptr<Entry> entryValue)
       : entry(std::move(entryValue)) {}
+  ~GetCtx() = default;
   GetCtx(const GetCtx&) = delete;
   GetCtx& operator=(const GetCtx&) = delete;
   GetCtx(GetCtx&&) = delete;

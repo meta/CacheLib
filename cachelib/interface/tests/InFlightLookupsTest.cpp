@@ -21,11 +21,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -156,16 +158,17 @@ TEST(InFlightLookupsTest, MovingOwnershipAbandonsOnlyReplacedLookup) {
 TEST(InFlightLookupsTest, WaitTaskOutlivesWaiterRegistryAndKey) {
   folly::ManualExecutor executor;
   std::optional<InFlightTransfers::LookupOwner> owner;
-  auto task = [&] {
+  std::optional<folly::coro::Task<InFlightTransfers::SharedLookupResult>> task;
+  {
     InFlightTransfers transfers;
     auto lookup = transfers.joinOrCreateLookup(std::string(100, 'k'));
     owner = std::move(lookup.owner);
     auto copied = lookup.waiter;
     auto moved = std::move(copied);
-    return moved.wait();
-  }();
+    task.emplace(moved.wait());
+  }
   ASSERT_TRUE(owner);
-  auto wait = folly::coro::co_withExecutor(&executor, std::move(task)).start();
+  auto wait = folly::coro::co_withExecutor(&executor, std::move(*task)).start();
   executor.drain();
   EXPECT_FALSE(wait.isReady());
   owner.reset();
@@ -305,10 +308,11 @@ TEST(InFlightLookupsTest, SharedHitPinsRemovedItemForLateWaiter) {
   auto component = factory.create();
   ASSERT_NE(component, nullptr);
   const std::string key = "key";
-  const std::string value = "pinned value";
+  constexpr std::string_view value = "pinned value";
+  constexpr uint32_t valueSize{value.size()};
   {
     auto allocated = folly::coro::blockingWait(component->allocate(
-        key, value.size(), facebook::cachelib::util::getCurrentTimeSec(), 0));
+        key, valueSize, facebook::cachelib::util::getCurrentTimeSec(), 0));
     ASSERT_TRUE(allocated.hasValue());
     auto descriptor = std::move(allocated).value();
     std::memcpy(descriptor.mutableData(), value.data(), value.size());
