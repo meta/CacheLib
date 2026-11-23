@@ -1793,6 +1793,14 @@ class CacheAllocator : public CacheBase {
     }
     auto item = reinterpret_cast<const Item*>(rawItem);
 
+    // rawItem is a random slot that another thread may be allocating into, so
+    // the reads of its refcount, expiry and key below race with the item
+    // constructor by design. They are speculative and the lookup below
+    // validates the result, so exempt them from TSAN like the reaper scan in
+    // traverseAndExpireItems(). The key is copied out first so the lookup
+    // itself stays instrumented.
+    std::optional<folly::annotate_ignore_thread_sanitizer_guard> tsanGuard{
+        std::in_place, __FILE__, __LINE__};
     if (!item->isAccessibleNoAsan()) {
       return {};
     }
@@ -1816,10 +1824,10 @@ class CacheAllocator : public CacheBase {
         !allocator_->isValidAllocMemory(key.data() + key.size() - 1)) {
       return {};
     }
-#if FOLLY_SANITIZE_ADDRESS
+#if FOLLY_SANITIZE_ADDRESS || FOLLY_SANITIZE_THREAD
     char stackBuf[KAllocation::kKeyMaxLenSmall];
     std::unique_ptr<char[]> heapBuf;
-    if (config_.isSlabAsanPoisoningEnabled()) {
+    if (folly::kIsSanitizeThread || config_.isSlabAsanPoisoningEnabled()) {
       // Copy the key out so we can use it without disabling instrumentation for
       // the whole find path. Don't use std utilities (like std::string or
       // std::memcpy) because they still have ASAN enabled. If it's a small key,
@@ -1837,6 +1845,7 @@ class CacheAllocator : public CacheBase {
       key = Key(buffer, key.size());
     }
 #endif
+    tsanGuard.reset();
     if (Item::getRequiredSize(key, /* size */ 0) > allocSize) {
       return {};
     }
