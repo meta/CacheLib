@@ -53,6 +53,29 @@ size_t getFileSize(std::string& fileName) {
 
 } // namespace
 
+TEST(NavySetupTest, ChecksumOffloadWithoutCrc32cIsDisabled) {
+  for (bool bigHashOffload : {false, true}) {
+    SCOPED_TRACE(bigHashOffload);
+    navy::NavyConfig config;
+    config.setMemoryFile(64 * 1024 * 1024);
+    config.setReaderAndWriterThreads(1, 1);
+    config.blockCache().setRegionSize(4 * 1024 * 1024);
+    config.bigHash().setSizePctAndMaxItemSize(10, 1024);
+    if (bigHashOffload) {
+      config.bigHash().setChecksumDsaOffload(true);
+    } else {
+      config.blockCache().setCopyAndChecksumDsaOffload(true);
+    }
+
+    // The engines reject offload with legacy CRC32, so setup must disable it
+    // before constructing them.
+    EXPECT_NO_THROW(createNavyCache(config, {}, {}, true, nullptr, false));
+
+    config.setChecksumType(navy::ChecksumType::Crc32c);
+    EXPECT_NO_THROW(createNavyCache(config, {}, {}, true, nullptr, false));
+  }
+}
+
 TEST(NavySetupTest, CacheSizes) {
   constexpr uint64_t kMB = 1024 * 1024;
   constexpr uint64_t kBlockSize = 4096;

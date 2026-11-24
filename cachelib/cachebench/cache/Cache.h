@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -782,6 +783,13 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     auto& bcConfig =
         nvmConfig.navyConfig.blockCache()
             .setDataChecksum(config_.navyDataChecksum)
+            .setCopyAndChecksumDsaOffload(
+                config_.navyChecksumOffload,
+                config_.navyChecksumOffloadMinSize,
+                config_.navyChecksumOffloadReadMinSize,
+                config_.navyChecksumOffloadCacheControl)
+            .setDirectFlush(config_.navyBlockCacheDirectFlush)
+            .setFlushCopyOffload(config_.navyBlockCacheFlushCopyOffload)
             .setCleanRegions(config_.navyCleanRegions,
                              config_.navyCleanRegionThreads)
             .setRegionSize(config_.navyRegionSizeMB * MB)
@@ -818,6 +826,9 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     }
 
     auto& bigHashConfig = nvmConfig.navyConfig.bigHash();
+    bigHashConfig.setChecksumDsaOffload(
+        config_.navyBigHashChecksumOffload,
+        config_.navyBigHashChecksumOffloadMinSize);
     if (config_.navyArenas.empty() && config_.navyBigHashSizePct > 0) {
       bigHashConfig
           .setSizePctAndMaxItemSize(config_.navyBigHashSizePct,
@@ -1694,11 +1705,14 @@ void Cache<Allocator>::setStringItem(WriteHandle& handle,
   }
 
   auto ptr = reinterpret_cast<char*>(getMemory(handle));
-  std::strncpy(ptr, str.c_str(), dataSize);
+  const size_t copyLen = std::min<size_t>(str.size() + 1, dataSize);
+  std::memcpy(ptr, str.c_str(), copyLen);
 
   // Make sure the copied string ends with null char
   if (str.size() + 1 > dataSize) {
     ptr[dataSize - 1] = '\0';
+  } else if (copyLen < dataSize) {
+    std::memset(ptr + copyLen, 0, dataSize - copyLen);
   }
 }
 

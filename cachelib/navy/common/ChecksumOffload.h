@@ -23,6 +23,7 @@
 
 #include "cachelib/common/AtomicCounter.h"
 #include "cachelib/navy/common/Buffer.h"
+#include "cachelib/navy/common/ChecksumType.h"
 
 namespace facebook {
 namespace cachelib {
@@ -157,6 +158,14 @@ bool checksumOffloadSupported();
 // consistent; returns false when built without DTO support. Callers should
 // enable offload only if this returns true.
 bool checksumOffloadSelfCheck();
+
+// Returns whether @engine can offload checksums: false, with a warning, if
+// data checksums are disabled, the checksum type is not CRC32C, or the DTO
+// backend is unavailable or fails its self-check. Callers then keep CPU
+// checksums.
+bool verifyChecksumOffload(folly::StringPiece engine,
+                           ChecksumType checksumType,
+                           bool dataChecksum = true);
 
 // Runtime check that a @size-byte DSA copy completes on the device and is
 // faithful; false when built without DTO or when DSA is unusable. Callers

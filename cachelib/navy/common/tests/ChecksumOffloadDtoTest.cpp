@@ -399,6 +399,17 @@ TEST_F(ChecksumOffloadDtoTest, SleepWaitWithZeroIntervalRunsEventBase) {
   EXPECT_EQ(expected, fakeBackend().timerDelaysNs);
 }
 
+TEST_F(ChecksumOffloadDtoTest,
+       VerifyChecksumOffloadDisablesIncompatibleConfigs) {
+  EXPECT_FALSE(verifyChecksumOffload("BlockCache", ChecksumType::Crc32));
+  EXPECT_FALSE(
+      verifyChecksumOffload("BlockCache", ChecksumType::Crc32c, false));
+  // Rejected before the self-check submits anything to the device.
+  EXPECT_EQ(0u, fakeBackend().submissions);
+
+  EXPECT_TRUE(verifyChecksumOffload("BlockCache", ChecksumType::Crc32c));
+}
+
 TEST_F(ChecksumOffloadDtoTest, FlushCopyOffloadIsForwardedFromNavyConfig) {
   for (bool enabled : {false, true}) {
     for (bool directFlush : {false, true}) {

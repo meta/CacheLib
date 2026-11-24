@@ -327,6 +327,14 @@ std::map<std::string, std::string> EnginesConfig::serialize() const {
       blockCache().getDataChecksum() ? "true" : "false";
   configMap["navyConfig::blockCacheFlushCopyOffload"] =
       blockCache().isFlushCopyOffload() ? "true" : "false";
+  configMap["navyConfig::blockCacheChecksumOffload"] =
+      blockCache().getChecksumOffload() ? "true" : "false";
+  configMap["navyConfig::blockCacheChecksumOffloadMinSize"] =
+      folly::to<std::string>(blockCache().getChecksumOffloadMinSize());
+  configMap["navyConfig::blockCacheChecksumOffloadReadMinSize"] =
+      folly::to<std::string>(blockCache().getChecksumOffloadReadMinSize());
+  configMap["navyConfig::blockCacheChecksumOffloadCacheControl"] =
+      blockCache().getChecksumOffloadCacheControl() ? "true" : "false";
   configMap["navyConfig::blockCacheSegmentedFifoSegmentRatio"] =
       folly::join(",", blockCache().getSFifoSegmentRatio());
 
@@ -339,6 +347,10 @@ std::map<std::string, std::string> EnginesConfig::serialize() const {
       folly::to<std::string>(bigHash().getBucketBfSize());
   configMap["navyConfig::bigHashSmallItemMaxSize"] =
       folly::to<std::string>(bigHash().getSmallItemMaxSize());
+  configMap["navyConfig::bigHashChecksumOffload"] =
+      bigHash().getChecksumOffload() ? "true" : "false";
+  configMap["navyConfig::bigHashChecksumOffloadMinSize"] =
+      folly::to<std::string>(bigHash().getChecksumOffloadMinSize());
   return configMap;
 }
 

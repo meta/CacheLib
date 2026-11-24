@@ -538,6 +538,35 @@ class BlockCacheConfig {
     return *this;
   }
 
+  // Offload BlockCache data checksums to Intel DSA via the DTO library: the
+  // write path fuses the value copy with CRC32C generation, and the read,
+  // reclaim and reinsertion paths verify on DSA. Ignored, with a warning,
+  // unless data checksums are enabled with CRC32C. Falls back to CPU CRC32C
+  // if DSA is unavailable.
+  //
+  // @minSize       Values smaller than this are checksummed on the CPU:
+  //                submitting and polling a descriptor costs about what the
+  //                CPU needs to CRC 16-32 KiB (16 KiB measured as break-even).
+  // @readMinSize   Size gate for verification: 0 = @minSize, UINT32_MAX =
+  //                always the CPU. Verifying has no CPU work to overlap with
+  //                DSA, so its break-even is higher. This only chooses where
+  //                values are verified; they are always verified while data
+  //                checksums are enabled.
+  // @cacheControl  Steer the copied value bytes toward the CPU cache. Turn off
+  //                when the device reads the region buffer next (directFlush
+  //                or flush copy offload).
+  BlockCacheConfig& setCopyAndChecksumDsaOffload(
+      bool enable,
+      uint32_t minSize = 16384,
+      uint32_t readMinSize = 0,
+      bool cacheControl = true) noexcept {
+    checksumOffload_ = enable;
+    checksumOffloadMinSize_ = minSize;
+    checksumOffloadReadMinSize_ = readMinSize;
+    checksumOffloadCacheControl_ = cacheControl;
+    return *this;
+  }
+
   BlockCacheConfig& setPreciseRemove(bool preciseRemove) noexcept {
     preciseRemove_ = preciseRemove;
     return *this;
@@ -626,6 +655,18 @@ class BlockCacheConfig {
 
   bool getDataChecksum() const { return dataChecksum_; }
 
+  bool getChecksumOffload() const { return checksumOffload_; }
+
+  uint32_t getChecksumOffloadMinSize() const { return checksumOffloadMinSize_; }
+
+  uint32_t getChecksumOffloadReadMinSize() const {
+    return checksumOffloadReadMinSize_;
+  }
+
+  bool getChecksumOffloadCacheControl() const {
+    return checksumOffloadCacheControl_;
+  }
+
   uint64_t getSize() const { return size_; }
 
   bool isRegionManagerFlushAsync() const { return regionManagerFlushAsync_; }
@@ -671,6 +712,11 @@ class BlockCacheConfig {
   uint32_t regionSize_{16 * 1024 * 1024};
   // Whether enabling data checksum for Navy BlockCache.
   bool dataChecksum_{true};
+  // DSA checksum offload settings. See setCopyAndChecksumDsaOffload().
+  bool checksumOffload_{false};
+  uint32_t checksumOffloadMinSize_{16384};
+  uint32_t checksumOffloadReadMinSize_{0};
+  bool checksumOffloadCacheControl_{true};
   // Whether to remove an item by checking the key (true) or only the hash value
   // (false).
   bool preciseRemove_{false};
@@ -688,6 +734,7 @@ class BlockCacheConfig {
   // Whether to write region buffer directly without intermediate copy.
   bool directFlush_{false};
 
+  // Whether to do the flush copy (when not directFlush) on Intel DSA.
   bool flushCopyOffload_{false};
 
   // Whether to use Combined entry block (For index entries and small sized
@@ -752,6 +799,17 @@ class BigHashConfig {
     return *this;
   }
 
+  // Offload bucket checksums to Intel DSA via the DTO library if the bucket
+  // size is at least @minSize; smaller buckets, including the default 4 KiB,
+  // stay on the CPU. Ignored, with a warning, unless the checksum type is
+  // CRC32C. Falls back to CPU CRC32C if DSA is unavailable.
+  BigHashConfig& setChecksumDsaOffload(bool enable,
+                                       uint32_t minSize = 16384) noexcept {
+    checksumOffload_ = enable;
+    checksumOffloadMinSize_ = minSize;
+    return *this;
+  }
+
   bool isBloomFilterEnabled() const { return bucketBfSize_ > 0; }
 
   unsigned int getSizePct() const { return sizePct_; }
@@ -763,6 +821,10 @@ class BigHashConfig {
   uint64_t getSmallItemMaxSize() const { return smallItemMaxSize_; }
 
   uint8_t getNumMutexesPower() const { return numMutexesPower_; }
+
+  bool getChecksumOffload() const { return checksumOffload_; }
+
+  uint32_t getChecksumOffloadMinSize() const { return checksumOffloadMinSize_; }
 
  private:
   // Percentage of how much of the device out of all is given to BigHash
@@ -779,6 +841,9 @@ class BigHashConfig {
   uint64_t smallItemMaxSize_{};
   // numMutexes = 1 << numMutexesPower_.
   uint8_t numMutexesPower_{14};
+  // DSA checksum offload settings. See setChecksumDsaOffload().
+  bool checksumOffload_{false};
+  uint32_t checksumOffloadMinSize_{16384};
 };
 
 // Config for a pair of small,large engines.

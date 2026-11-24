@@ -21,6 +21,7 @@
 #include "cachelib/interface/components/FlashCacheComponent.h"
 #include "cachelib/interface/utils/CoroFiberAdapter.h"
 #include "cachelib/navy/block_cache/FifoPolicy.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 
 using namespace facebook::cachelib::interface;
 
@@ -145,6 +146,15 @@ std::unique_ptr<CacheComponent> createFlashCacheComponent(
     bcConfig.indexConfig.enableTrackItemHistory();
   }
   bcConfig.indexConfig.validate();
+  bcConfig.checksumOffload =
+      config.navyChecksumOffload &&
+      navy::verifyChecksumOffload("BlockCache", bcConfig.checksumType,
+                                  bcConfig.checksum);
+  bcConfig.checksumOffloadMinSize = config.navyChecksumOffloadMinSize;
+  bcConfig.checksumOffloadReadMinSize = config.navyChecksumOffloadReadMinSize;
+  bcConfig.checksumOffloadCacheControl = config.navyChecksumOffloadCacheControl;
+  bcConfig.directFlush = config.navyBlockCacheDirectFlush;
+  bcConfig.flushCopyOffload = config.navyBlockCacheFlushCopyOffload;
   // Note: LRU is not yet supported
   if (config.navySegmentedFifoSegmentRatio.empty() ||
       config.navySegmentedFifoSegmentRatio.size() == 1) {

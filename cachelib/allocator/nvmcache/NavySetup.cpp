@@ -142,6 +142,9 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
   // Set number of mutexes from config
   bigHash->setNumMutexesPower(bigHashConfig.getNumMutexesPower());
 
+  bigHash->setChecksumOffload(bigHashConfig.getChecksumOffload(),
+                              bigHashConfig.getChecksumOffloadMinSize());
+
   proto.setBigHash(std::move(bigHash), bigHashConfig.getSmallItemMaxSize());
 
   if (bigHashCacheOffset <= bigHashStartOffsetLimit) {
@@ -200,6 +203,11 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   blockCache->setLayout(blockCacheOffset, blockCacheSize, regionSize);
   blockCache->setChecksum(blockCacheConfig.getDataChecksum());
   blockCache->setChecksumType(checksumType);
+  blockCache->setChecksumOffload(
+      blockCacheConfig.getChecksumOffload(),
+      blockCacheConfig.getChecksumOffloadMinSize(),
+      blockCacheConfig.getChecksumOffloadReadMinSize(),
+      blockCacheConfig.getChecksumOffloadCacheControl());
 
   // set eviction policy
   auto segmentRatio = blockCacheConfig.getSFifoSegmentRatio();

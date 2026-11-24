@@ -1,0 +1,27 @@
+{
+  "cache_config": {
+    "cacheSizeMB": 128,
+    "nvmCacheSizeMB": 512,
+    "navyRegionSizeMB": 4,
+    "navyReaderThreads": 4,
+    "navyWriterThreads": 2,
+    "navyBigHashSizePct": 0,
+    "navyDataChecksum": true,
+    "navyChecksumType": "crc32c",
+    "navyChecksumOffload": true,
+    "navyChecksumOffloadMinSize": 16384,
+    "printNvmCounters": true
+  },
+  "test_config": {
+    "numOps": 100000,
+    "numThreads": 4,
+    "numKeys": 4096,
+    "keySizeRange": [16, 32],
+    "keySizeRangeProbability": [1.0],
+    "valSizeRange": [65536, 131072],
+    "valSizeRangeProbability": [1.0],
+    "getRatio": 0.8,
+    "setRatio": 0.2,
+    "delRatio": 0.0
+  }
+}

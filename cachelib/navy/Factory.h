@@ -53,6 +53,16 @@ class BlockCacheProto {
   // Select the persisted checksum format (default: CRC32).
   virtual void setChecksumType(ChecksumType checksumType) = 0;
 
+  // (Optional) Offload data checksumming to Intel DSA for values of at least
+  // @minSize bytes (@readMinSize for verification; 0 = @minSize), with the
+  // @cacheControl hint on the fused write-path copy. Ignored, with a warning,
+  // unless checksumming is enabled with CRC32C. Without a usable DTO backend,
+  // checksums run on the CPU. See BlockCache::Config.
+  virtual void setChecksumOffload(bool enable,
+                                  uint32_t minSize,
+                                  uint32_t readMinSize,
+                                  bool cacheControl) = 0;
+
   // set*EvictionPolicy function family: sets eviction policy. Supports LRU,
   // LRU with deferred insert and FIFO. Must set up one of them.
 
@@ -144,6 +154,11 @@ class BigHashProto {
   // (Optional) Set number of mutexes for bucket locking as power of 2.
   // numMutexes = 1 << numMutexesPower. Default: 14 (16K mutexes)
   virtual void setNumMutexesPower(uint8_t numMutexesPower) = 0;
+
+  // (Optional) Offload bucket checksumming to Intel DSA if the bucket size is
+  // at least @minSize. Ignored, with a warning, unless the checksum type is
+  // CRC32C; unavailable offload falls back to CPU CRC32C.
+  virtual void setChecksumOffload(bool enable, uint32_t minSize) = 0;
 };
 
 class EnginePairProto {

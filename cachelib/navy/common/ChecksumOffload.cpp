@@ -429,6 +429,37 @@ bool checksumOffloadSelfCheck() {
   return true;
 }
 
+bool verifyChecksumOffload(folly::StringPiece engine,
+                           ChecksumType checksumType,
+                           bool dataChecksum) {
+  if (!dataChecksum) {
+    XLOGF(WARN,
+          "{}: disabling checksum offload because data checksums are disabled.",
+          engine);
+    return false;
+  }
+  if (checksumType != ChecksumType::Crc32c) {
+    XLOGF(WARN,
+          "{}: disabling checksum offload, which requires CRC32C checksums.",
+          engine);
+    return false;
+  }
+  if (!checksumOffloadSupported()) {
+    XLOGF(WARN,
+          "{}: built without DTO support. Falling back to software CRC32C.",
+          engine);
+    return false;
+  }
+  if (!checksumOffloadSelfCheck()) {
+    XLOGF(
+        WARN,
+        "{}: DSA checksum self-check failed. Falling back to software CRC32C.",
+        engine);
+    return false;
+  }
+  return true;
+}
+
 bool copyOffloadSelfCheck(size_t size) {
   if (!checksumOffloadSupported()) {
     return false;

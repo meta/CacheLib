@@ -178,6 +178,13 @@ TEST(NavyConfigTest, Serialization) {
 
   auto expectedConfigMap = std::map<std::string, std::string>();
   expectedConfigMap["navyConfig::checksumType"] = "crc32";
+  expectedConfigMap["navyConfig::blockCacheChecksumOffload"] = "false";
+  expectedConfigMap["navyConfig::blockCacheChecksumOffloadMinSize"] = "16384";
+  expectedConfigMap["navyConfig::blockCacheChecksumOffloadReadMinSize"] = "0";
+  expectedConfigMap["navyConfig::blockCacheChecksumOffloadCacheControl"] =
+      "true";
+  expectedConfigMap["navyConfig::bigHashChecksumOffload"] = "false";
+  expectedConfigMap["navyConfig::bigHashChecksumOffloadMinSize"] = "16384";
   expectedConfigMap["navyConfig::admissionPolicy"] = "dynamic_random";
   expectedConfigMap["navyConfig::admissionProbability"] = "0";
   expectedConfigMap["navyConfig::admissionWriteRate"] = "100";
@@ -238,6 +245,25 @@ TEST(NavyConfigTest, FlushCopyOffloadConfiguration) {
     EXPECT_EQ(enabled, config.blockCache().isFlushCopyOffload());
     EXPECT_EQ(enabled ? "true" : "false",
               config.serialize().at("navyConfig::blockCacheFlushCopyOffload"));
+  }
+}
+
+TEST(NavyConfigTest, ChecksumDsaOffloadConfiguration) {
+  NavyConfig config;
+  config.blockCache().setCopyAndChecksumDsaOffload(true, 8192, 65536, false);
+  config.bigHash().setChecksumDsaOffload(true, 4096);
+
+  const std::map<std::string, std::string> expected{
+      {"navyConfig::blockCacheChecksumOffload", "true"},
+      {"navyConfig::blockCacheChecksumOffloadMinSize", "8192"},
+      {"navyConfig::blockCacheChecksumOffloadReadMinSize", "65536"},
+      {"navyConfig::blockCacheChecksumOffloadCacheControl", "false"},
+      {"navyConfig::bigHashChecksumOffload", "true"},
+      {"navyConfig::bigHashChecksumOffloadMinSize", "4096"},
+  };
+  const auto serialized = config.serialize();
+  for (const auto& [key, value] : expected) {
+    EXPECT_EQ(value, serialized.at(key)) << key;
   }
 }
 

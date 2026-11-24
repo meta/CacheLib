@@ -27,6 +27,7 @@
 #include "cachelib/navy/block_cache/BlockCache.h"
 #include "cachelib/navy/block_cache/FifoPolicy.h"
 #include "cachelib/navy/block_cache/LruPolicy.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Device.h"
 #include "cachelib/navy/driver/Driver.h"
 
@@ -58,6 +59,16 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
 
   void setChecksumType(ChecksumType checksumType) override {
     config_.checksumType = checksumType;
+  }
+
+  void setChecksumOffload(bool enable,
+                          uint32_t minSize,
+                          uint32_t readMinSize,
+                          bool cacheControl) override {
+    config_.checksumOffload = enable;
+    config_.checksumOffloadMinSize = minSize;
+    config_.checksumOffloadReadMinSize = readMinSize;
+    config_.checksumOffloadCacheControl = cacheControl;
   }
 
   void setLruEvictionPolicy() override {
@@ -163,6 +174,10 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
                                  DestructorCallback cb) && {
     config_.checkExpired = std::move(checkExpired);
     config_.destructorCb = std::move(cb);
+    if (config_.checksumOffload) {
+      config_.checksumOffload = verifyChecksumOffload(
+          "BlockCache", config_.checksumType, config_.checksum);
+    }
     return std::make_unique<BlockCache>(std::move(config_));
   }
 
@@ -201,6 +216,11 @@ class BigHashProtoImpl final : public BigHashProto {
     config_.numMutexesPower = numMutexesPower;
   }
 
+  void setChecksumOffload(bool enable, uint32_t minSize) override {
+    config_.checksumOffload = enable;
+    config_.checksumOffloadMinSize = minSize;
+  }
+
   void setDevice(Device* device) { config_.device = device; }
 
   void setDestructorCb(DestructorCallback cb) {
@@ -209,6 +229,10 @@ class BigHashProtoImpl final : public BigHashProto {
 
   std::unique_ptr<Engine> create(ExpiredCheck checkExpired) && {
     config_.checkExpired = std::move(checkExpired);
+    if (config_.checksumOffload &&
+        !verifyChecksumOffload("BigHash", config_.checksumType)) {
+      config_.checksumOffload = false;
+    }
     if (bloomFilterEnabled_) {
       if (config_.bucketSize == 0) {
         throw std::invalid_argument{"invalid bucket size"};

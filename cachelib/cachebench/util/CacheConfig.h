@@ -279,6 +279,29 @@ struct CacheConfig : public JSONConfig {
   // default
   bool navyDataChecksum{true};
 
+  // offloads navy BlockCache data checksumming (fused with the value copy on
+  // the write path) to Intel DSA via the DTO library, for values of at least
+  // navyChecksumOffloadMinSize bytes. Ignored, with a warning, unless
+  // navyDataChecksum is true and navyChecksumType is "crc32c". Falls back to
+  // CPU CRC32C if DSA is unavailable.
+  bool navyChecksumOffload{false};
+  // BlockCache flush path: write the region buffer straight to the device
+  // (no intermediate copy), or do that copy on Intel DSA.
+  bool navyBlockCacheDirectFlush{false};
+  bool navyBlockCacheFlushCopyOffload{false};
+  uint32_t navyChecksumOffloadMinSize{16384};
+  // separate gate for read-side verification (0 = same as the write gate;
+  // 4294967295 disables read-side offload), and the cache-control hint on the
+  // fused write copy. See BlockCache::Config.
+  uint32_t navyChecksumOffloadReadMinSize{0};
+  bool navyChecksumOffloadCacheControl{true};
+
+  // offloads navy BigHash bucket checksumming to Intel DSA when
+  // navyBigHashBucketSize is at least navyBigHashChecksumOffloadMinSize.
+  // Ignored, with a warning, unless navyChecksumType is "crc32c".
+  bool navyBigHashChecksumOffload{false};
+  uint32_t navyBigHashChecksumOffloadMinSize{16384};
+
   // by default, only store the size requested by the user into nvm cache
   bool truncateItemToOriginalAllocSizeInNvm = false;
 
