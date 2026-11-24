@@ -16,13 +16,45 @@
 
 #pragma once
 
-#include <folly/Function.h>
+#include <folly/Range.h>
 
+#include <array>
+#include <magic_enum/magic_enum.hpp>
+
+#include "cachelib/common/AtomicCounter.h"
 #include "cachelib/navy/common/Buffer.h"
 
 namespace facebook {
 namespace cachelib {
+namespace util {
+class CounterVisitor;
+}
 namespace navy {
+
+enum class OffloadOutcome : uint8_t {
+  OFFLOADED,
+  BELOW_MIN,
+  SUBMIT_FALLBACK,
+  COMPLETION_FALLBACK,
+};
+
+class OffloadStats {
+ public:
+  void record(OffloadOutcome outcome, size_t bytes) {
+    ops_[*magic_enum::enum_index(outcome)].inc();
+    if (outcome == OffloadOutcome::OFFLOADED) {
+      offloadedBytes_.add(bytes);
+    }
+  }
+
+  void getCounters(const util::CounterVisitor& visitor,
+                   folly::StringPiece prefix,
+                   bool hasSizeCutoff = true) const;
+
+ private:
+  std::array<TLCounter, magic_enum::enum_count<OffloadOutcome>()> ops_;
+  TLCounter offloadedBytes_;
+};
 
 // How AsyncChecksumOp::wait() waits for the device. kSpinOrYield yields to
 // ready fibers, otherwise pause-polls. kSleep suspends EventBase-backed fibers
@@ -31,13 +63,6 @@ namespace navy {
 // Wakeups can be delayed by scheduling. kSleep suits latency-insensitive flush
 // copies.
 enum class LargeCopyWait : uint8_t { kSpinOrYield, kSleep };
-
-// Checksum (and fused copy+checksum) helpers that can offload to Intel DSA
-// via the DTO library when built with CACHELIB_BUILD_WITH_DTO. Without DTO
-// support (or when DSA is unavailable at runtime), they run equivalent
-// software implementations. In all cases they return raw CRC-32C of @src
-// (seed 0, no final inversion), matching
-// checksum(src, ChecksumType::Crc32c).
 
 // A single asynchronous checksum, fused copy+checksum, or plain copy.
 // submit*() enqueues the operation on DSA and returns immediately (or runs
@@ -78,7 +103,8 @@ class AsyncChecksumOp {
   // returns 0. Same destination contract as submitCopyAndChecksum.
   void submitCopy(uint8_t* dest, BufferView src, bool cacheControl);
 
-  // Completes the operation and returns raw CRC-32C (0 for a plain copy).
+  // Completes the operation and returns raw CRC-32C (seed 0, no final
+  // inversion, matching checksum(src, ChecksumType::Crc32c)), or 0 for copy.
   uint32_t wait(LargeCopyWait policy = LargeCopyWait::kSpinOrYield,
                 uint32_t sleepPollUs = 200);
 
@@ -88,6 +114,16 @@ class AsyncChecksumOp {
   // software. Lets a self-check tell a working accelerator from a silently
   // failing one - both return the correct checksum.
   bool completedOnDevice() const { return onDevice_; }
+
+  // Result of the most recent operation after wait(). Size skips are accounted
+  // for by callers and never reach this helper.
+  OffloadOutcome outcome() const {
+    if (onDevice_) {
+      return OffloadOutcome::OFFLOADED;
+    }
+    return submitted_ ? OffloadOutcome::COMPLETION_FALLBACK
+                      : OffloadOutcome::SUBMIT_FALLBACK;
+  }
 
  private:
   enum class State : uint8_t { kIdle, kCpuDone, kDsaPending, kWaiting };
@@ -104,6 +140,7 @@ class AsyncChecksumOp {
   State state_{State::kIdle};
   Kind kind_{Kind::kCrc};
   bool onDevice_{false};
+  bool submitted_{false};
   uint32_t crc_{0};
   [[maybe_unused]] uint8_t* dest_{nullptr};
   BufferView src_;
@@ -120,49 +157,6 @@ bool checksumOffloadSupported();
 // consistent; returns false when built without DTO support. Callers should
 // enable offload only if this returns true.
 bool checksumOffloadSelfCheck();
-
-// Copies @src to @dest and returns raw CRC-32C of @src, as a single fused
-// DSA "Memory Copy with CRC Generation" operation when available. The copy
-// lands toward the CPU cache (cache control) since such destinations are
-// typically read again soon.
-// @cacheControl steers the copy output toward the CPU cache; keep it on when
-// the destination is read again by the CPU soon (in-memory lookup hits, a CPU
-// flush copy), off when the next reader is a DMA engine.
-//
-// The @overlap callback is invoked exactly once after submission. Use it for
-// CPU work that can proceed while the accelerator operates. It may read the
-// source range but must not write it, and must not access the destination
-// range at all.
-// Note: when the operation falls back to software (non-DTO build, or DSA
-// submission failure), the copy+checksum completes synchronously inside the
-// submit step, so @overlap runs after the operation rather than overlapping
-// it — the callback's constraints above still apply either way.
-uint32_t copyAndChecksum(uint8_t* dest,
-                         BufferView src,
-                         folly::FunctionRef<void()> overlap,
-                         bool cacheControl = true);
-
-// Returns raw CRC-32C of @src, computed by DSA when available.
-// @overlap runs once after submission and may read @src but must not modify it.
-// With CPU fallback, it runs after the checksum completes.
-uint32_t checksumWithOverlap(BufferView src,
-                             folly::FunctionRef<void()> overlap);
-
-// Copies @n bytes from @src to @dest, on DSA when the build has DTO support,
-// the size fits the work queue's transfer limit and submission succeeds,
-// otherwise with memcpy. Returns true iff the accelerator performed the whole
-// copy; an empty copy returns false. The source and destination must not
-// overlap. DSA work queues must be configured with block-on-fault.
-// Yields the calling fiber while the device works, like the checksum ops.
-inline bool copyWithOffload(uint8_t* dest, const uint8_t* src, size_t n) {
-  if (n == 0) {
-    return false;
-  }
-  AsyncChecksumOp op;
-  op.submitCopy(dest, BufferView{n, src}, true);
-  op.wait();
-  return op.completedOnDevice();
-}
 
 // Runtime check that a @size-byte DSA copy completes on the device and is
 // faithful; false when built without DTO or when DSA is unusable. Callers

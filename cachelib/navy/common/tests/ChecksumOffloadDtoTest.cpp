@@ -87,7 +87,6 @@ FakeOperation& operation(dto_async_op* op) {
   return *std::launder(reinterpret_cast<FakeOperation*>(op));
 }
 
-[[noreturn]] void failOverlap() { throw std::runtime_error("overlap failed"); }
 } // namespace
 
 extern "C" {
@@ -250,6 +249,7 @@ TEST_F(ChecksumOffloadDtoTest, RefusedSubmissionCompletesOnCpuWithoutPolling) {
   EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
   EXPECT_EQ(src, dest);
   EXPECT_FALSE(op.completedOnDevice());
+  EXPECT_EQ(OffloadOutcome::SUBMIT_FALLBACK, op.outcome());
   op.submitChecksum(view);
   EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
   EXPECT_FALSE(op.completedOnDevice());
@@ -269,10 +269,16 @@ TEST_F(ChecksumOffloadDtoTest, FailedCompletionIsRepairedOnCpu) {
   EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
   EXPECT_EQ(src, dest);
   EXPECT_FALSE(op.completedOnDevice());
+  EXPECT_EQ(OffloadOutcome::COMPLETION_FALLBACK, op.outcome());
   op.submitChecksum(view);
   EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
   EXPECT_FALSE(op.completedOnDevice());
   EXPECT_EQ(before.fallbacks + 2, getChecksumWaitStats().fallbacks);
+
+  fakeBackend().refuseSubmission = true;
+  op.submitChecksum(view);
+  EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
+  EXPECT_EQ(OffloadOutcome::SUBMIT_FALLBACK, op.outcome());
 }
 
 TEST_F(ChecksumOffloadDtoTest, PlainCopiesDistinguishRefusalAndRepair) {
@@ -287,9 +293,10 @@ TEST_F(ChecksumOffloadDtoTest, PlainCopiesDistinguishRefusalAndRepair) {
       fakeBackend().failCompletion = failed;
       std::fill(dest.begin(), dest.end(), 0);
       const auto checksumBefore = getChecksumWaitStats();
-      const bool onDevice =
-          copyWithOffload(dest.data(), src.data(), src.size());
-      EXPECT_EQ(!refused && !failed, onDevice);
+      AsyncChecksumOp op;
+      op.submitCopy(dest.data(), BufferView{src.size(), src.data()}, true);
+      EXPECT_EQ(0u, op.wait());
+      EXPECT_EQ(!refused && !failed, op.completedOnDevice());
       EXPECT_EQ(src, dest);
       EXPECT_EQ(1u, fakeBackend().submissions);
       EXPECT_EQ(refused ? 0u : 2u, fakeBackend().polls);
@@ -418,7 +425,7 @@ TEST_F(ChecksumOffloadDtoTest, FlushCopyOffloadIsForwardedFromNavyConfig) {
   }
 }
 
-TEST_F(ChecksumOffloadDtoTest, CopyOutOffloadsBlobsFromMinSize) {
+TEST_F(ChecksumOffloadDtoTest, CopyOutAccountsForEachWorkloadOutcome) {
   constexpr uint32_t kMinSize = 4096;
   LruAllocator::NvmCacheConfig nvmConfig;
   nvmConfig.navyConfig.setMemoryFile(64 * 1024 * 1024);
@@ -435,6 +442,10 @@ TEST_F(ChecksumOffloadDtoTest, CopyOutOffloadsBlobsFromMinSize) {
   LruAllocator cache(config);
   // The startup self-check is the only device work so far.
   ASSERT_EQ(1u, fakeBackend().submissions);
+  const auto initialRates = cache.getNvmCacheStatsMap().getRates();
+  EXPECT_EQ(0, initialRates.at("copy_out_ops"));
+  EXPECT_EQ(0, initialRates.at("copy_out_offloaded_ops"));
+  EXPECT_EQ(0, initialRates.at("copy_out_offloaded_bytes"));
   const auto pool = cache.addPool("default", 8 * 1024 * 1024);
   const auto insert = [&](const std::string& key, uint32_t size, uint8_t fill) {
     auto handle = cache.allocate(pool, key, size);
@@ -443,10 +454,19 @@ TEST_F(ChecksumOffloadDtoTest, CopyOutOffloadsBlobsFromMinSize) {
     cache.insertOrReplace(handle);
   };
 
-  for (const auto [size, fill] :
-       {std::pair<uint32_t, uint8_t>{kMinSize - 1, 0x5A}, {kMinSize, 0xA5}}) {
-    SCOPED_TRACE(size);
-    const std::string key = "copy-out-" + std::to_string(size);
+  struct CopyCase {
+    uint32_t size;
+    const char* outcome;
+    bool refuseSubmission{false};
+    bool failCompletion{false};
+  };
+  for (const auto& [size, expected, refuseSubmission, failCompletion] :
+       {CopyCase{kMinSize - 1, "below_min"}, CopyCase{kMinSize, "offloaded"},
+        CopyCase{kMinSize, "submit_fallback", true},
+        CopyCase{kMinSize, "completion_fallback", false, true}}) {
+    SCOPED_TRACE(expected);
+    const std::string key = std::string{"copy-out-"} + expected;
+    constexpr uint8_t fill = 0xA5;
     const std::vector<uint8_t> value(size, fill);
     insert(key, size, fill);
     // Drain insertOrReplace's flash delete so it cannot drop the eviction
@@ -455,19 +475,38 @@ TEST_F(ChecksumOffloadDtoTest, CopyOutOffloadsBlobsFromMinSize) {
     // Same-size fillers evict the key from DRAM, which writes it to flash.
     for (uint32_t i = 0; cache.peek(key) != nullptr; ++i) {
       ASSERT_LT(i, 10'000u);
-      insert("filler-" + std::to_string(size) + "-" + std::to_string(i), size,
-             0);
+      insert(key + "-filler-" + std::to_string(i), size, 0);
     }
     cache.flushNvmCache();
 
     const auto submissionsBefore = fakeBackend().submissions;
+    const auto ratesBefore = cache.getNvmCacheStatsMap().getRates();
+    fakeBackend().refuseSubmission = refuseSubmission;
+    fakeBackend().failCompletion = failCompletion;
     auto promoted = cache.find(key);
     promoted.wait();
+    fakeBackend().refuseSubmission = false;
+    fakeBackend().failCompletion = false;
     ASSERT_NE(nullptr, promoted);
     EXPECT_TRUE(promoted.wentToNvm());
     EXPECT_EQ(size >= kMinSize ? 1u : 0u,
               fakeBackend().submissions - submissionsBefore);
     EXPECT_EQ(0, std::memcmp(value.data(), promoted->getMemory(), size));
+    const auto ratesAfter = cache.getNvmCacheStatsMap().getRates();
+    const auto delta = [&](const std::string& name) {
+      return ratesAfter.at(name) - ratesBefore.at(name);
+    };
+    EXPECT_EQ(1, delta("copy_out_ops"));
+    EXPECT_EQ(size, delta("copy_out_bytes"));
+    const bool offloaded =
+        size >= kMinSize && !refuseSubmission && !failCompletion;
+    EXPECT_EQ(offloaded ? size : 0, delta("copy_out_offloaded_bytes"));
+    for (const auto* outcome :
+         {"offloaded", "below_min", "submit_fallback", "completion_fallback"}) {
+      const auto prefix = std::string{"copy_out_"} + outcome;
+      const bool matched = std::strcmp(expected, outcome) == 0;
+      EXPECT_EQ(matched ? 1 : 0, delta(prefix + "_ops")) << outcome;
+    }
   }
 }
 
@@ -483,6 +522,7 @@ TEST_F(ChecksumOffloadDtoTest, NormalWaitYieldsToReadyFiber) {
     op.submitCopyAndChecksum(dest.data(), view, true);
     EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
     EXPECT_TRUE(op.completedOnDevice());
+    EXPECT_EQ(OffloadOutcome::OFFLOADED, op.outcome());
     EXPECT_TRUE(otherFiberRan);
   });
   fm.addTask([&] { otherFiberRan = true; });
@@ -500,8 +540,13 @@ TEST_F(ChecksumOffloadDtoTest, UnwindingDrainsWithoutYieldingToReadyFiber) {
   folly::EventBase evb;
   auto& fm = folly::fibers::getFiberManager(evb);
   fm.addTask([&] {
-    EXPECT_THROW(copyAndChecksum(dest.data(), view, failOverlap),
-                 std::runtime_error);
+    EXPECT_THROW(
+        {
+          AsyncChecksumOp op;
+          op.submitCopyAndChecksum(dest.data(), view, true);
+          throw std::runtime_error("overlap failed");
+        },
+        std::runtime_error);
     EXPECT_FALSE(otherFiberRan);
     EXPECT_EQ(1u, fakeBackend().completions);
     EXPECT_EQ(src, dest);

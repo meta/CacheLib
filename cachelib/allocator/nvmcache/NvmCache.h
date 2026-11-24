@@ -584,6 +584,10 @@ class NvmCache {
 
   // Whether the DSA copy-out offload passed its runtime self-check.
   bool copyOutOffload_{false};
+  // Copy-out stats, counted only when Config::copyOutOffload is set.
+  TLCounter copyOutOps_;
+  TLCounter copyOutBytes_;
+  navy::OffloadStats copyOutStats_;
   C& cache_;                            //< cache allocator
   std::atomic<bool> navyEnabled_{true}; //< switch to turn off/on navy
 
@@ -1562,11 +1566,24 @@ void NvmCache<C>::copyBlobData(void* dest, const void* src, size_t n) {
   if (n == 0) {
     return;
   }
+  if (!config_.copyOutOffload) {
+    ::memcpy(dest, src, n);
+    return;
+  }
+  copyOutOps_.inc();
+  copyOutBytes_.add(n);
   if (copyOutOffload_ && n >= config_.copyOutOffloadMinSize) {
-    navy::copyWithOffload(reinterpret_cast<uint8_t*>(dest),
-                          reinterpret_cast<const uint8_t*>(src), n);
+    navy::AsyncChecksumOp op;
+    op.submitCopy(static_cast<uint8_t*>(dest),
+                  navy::BufferView{n, static_cast<const uint8_t*>(src)},
+                  true /* cacheControl */);
+    op.wait();
+    copyOutStats_.record(op.outcome(), n);
   } else {
     ::memcpy(dest, src, n);
+    if (copyOutOffload_) {
+      copyOutStats_.record(navy::OffloadOutcome::BELOW_MIN, n);
+    }
   }
 }
 
@@ -1787,6 +1804,12 @@ template <typename C>
 util::StatsMap NvmCache<C>::getStatsMap() const {
   util::StatsMap statsMap;
   navyCache_->getCounters(statsMap.createCountVisitor());
+  if (config_.copyOutOffload) {
+    statsMap.insertCount("copy_out_active", copyOutOffload_);
+    statsMap.insertRate("copy_out_ops", copyOutOps_.get());
+    statsMap.insertRate("copy_out_bytes", copyOutBytes_.get());
+    copyOutStats_.getCounters(statsMap.createCountVisitor(), "copy_out");
+  }
   if (accessTimeMap_) {
     accessTimeMap_->getCounters(statsMap.createCountVisitor());
   }

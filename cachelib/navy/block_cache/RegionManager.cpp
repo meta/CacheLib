@@ -55,6 +55,7 @@ RegionManager::RegionManager(uint32_t numRegions,
       allowReadDuringReclaim_(allowReadDuringReclaim),
       recoverEvictionPolicy_{recoverEvictionPolicy},
       directFlush_{directFlush},
+      flushCopyOffloadConfigured_{flushCopyOffload},
       flushCopyOffload_{flushCopyOffload},
       evictCb_{std::move(evictCb)},
       cleanupCb_{std::move(cleanupCb)},
@@ -158,6 +159,9 @@ Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
       }
     } else {
       auto writeBuffer = device_.makeIOBuffer(view.size());
+      if (flushCopyOffloadConfigured_) {
+        flushCopyBytes_.add(view.size());
+      }
       if (flushCopyOffload_) {
         // One Memory Move descriptor. Disable cache control because the
         // storage device reads the destination next, and sleep between polls
@@ -165,6 +169,7 @@ Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
         AsyncChecksumOp op;
         op.submitCopy(writeBuffer.data(), view, false /* cacheControl */);
         op.wait(LargeCopyWait::kSleep, 200 /* us */);
+        flushCopyOffloadStats_.record(op.outcome(), view.size());
       } else {
         writeBuffer.copyFrom(0, view);
       }
@@ -797,6 +802,13 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_external_fragmentation", externalFragmentation_.get());
   visitor("navy_bc_physical_written", physicalWrittenCount_.get(),
           CounterVisitor::CounterType::RATE);
+  if (flushCopyOffloadConfigured_) {
+    const auto rate = CounterVisitor::CounterType::RATE;
+    visitor("navy_bc_flush_copy_active", flushCopyOffload_);
+    visitor("navy_bc_flush_copy_total_bytes", flushCopyBytes_.get(), rate);
+    flushCopyOffloadStats_.getCounters(visitor, "navy_bc_flush_copy",
+                                       false /* hasSizeCutoff */);
+  }
   visitor("navy_bc_inmem_active", numInMemBufActive_.get());
   visitor("navy_bc_inmem_waiting_flush", numInMemBufWaitingFlush_.get());
   visitor("navy_bc_inmem_flush_retries", numInMemBufFlushRetries_.get(),

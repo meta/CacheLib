@@ -16,6 +16,8 @@
 
 #include "cachelib/navy/common/ChecksumOffload.h"
 
+#include <fmt/core.h>
+#include <folly/String.h>
 #include <folly/fibers/FiberManager.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/Asm.h>
@@ -24,9 +26,11 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "cachelib/common/AtomicCounter.h"
+#include "cachelib/common/Utils.h"
 #include "cachelib/navy/common/Hash.h"
 
 #ifdef CACHELIB_BUILD_WITH_DTO
@@ -46,6 +50,24 @@
 namespace facebook {
 namespace cachelib {
 namespace navy {
+
+void OffloadStats::getCounters(const util::CounterVisitor& visitor,
+                               folly::StringPiece prefix,
+                               bool hasSizeCutoff) const {
+  constexpr auto names = magic_enum::enum_names<OffloadOutcome>();
+  constexpr auto belowMin = *magic_enum::enum_index(OffloadOutcome::BELOW_MIN);
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (!hasSizeCutoff && i == belowMin) {
+      continue;
+    }
+    std::string suffix{names[i]};
+    folly::toLowerAscii(suffix);
+    visitor(fmt::format("{}_{}_ops", prefix, suffix), ops_[i].get(),
+            util::CounterVisitor::RATE);
+  }
+  visitor(fmt::format("{}_offloaded_bytes", prefix), offloadedBytes_.get(),
+          util::CounterVisitor::RATE);
+}
 
 namespace {
 struct ChecksumCounters {
@@ -253,12 +275,14 @@ void AsyncChecksumOp::submitImpl(Kind kind,
     break;
   }
   if (rc == DTO_ASYNC_SUBMITTED) {
+    submitted_ = true;
     state_ = State::kDsaPending;
     return;
   }
 #else
   (void)cacheControl;
 #endif
+  submitted_ = false;
   onDevice_ = false;
   crc_ = computeCpuResult();
   state_ = State::kCpuDone;
@@ -345,24 +369,6 @@ CopyLargeWaitStats getChecksumWaitStats() {
   st.waitUs = stats.waitUs.get();
   st.fallbacks = stats.fallbacks.get();
   return st;
-}
-
-uint32_t copyAndChecksum(uint8_t* dest,
-                         BufferView src,
-                         folly::FunctionRef<void()> overlap,
-                         bool cacheControl) {
-  AsyncChecksumOp op;
-  op.submitCopyAndChecksum(dest, src, cacheControl);
-  overlap();
-  return op.wait();
-}
-
-uint32_t checksumWithOverlap(BufferView src,
-                             folly::FunctionRef<void()> overlap) {
-  AsyncChecksumOp op;
-  op.submitChecksum(src);
-  overlap();
-  return op.wait();
 }
 
 bool checksumOffloadSelfCheck() {

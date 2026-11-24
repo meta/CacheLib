@@ -30,9 +30,9 @@
 namespace facebook::cachelib::navy::tests {
 class RegionManagerTestPeer {
  public:
-  // Exercise the copy helper even when the runtime probe cannot find DSA.
-  static void enableCopyOffload(RegionManager& rm) {
-    rm.flushCopyOffload_ = true;
+  // Test both outcomes of the startup probe independently of DSA availability.
+  static void setCopyOffloadActive(RegionManager& rm, bool active) {
+    rm.flushCopyOffload_ = active;
   }
 };
 
@@ -52,6 +52,24 @@ double getRegionManagerCounter(const RegionManager& rm,
     }
   }});
   return result;
+}
+
+void expectFlushCopyOutcomes(const RegionManager& rm,
+                             uint32_t regionSize,
+                             unsigned int attempts) {
+  const auto counter = [&](folly::StringPiece name) {
+    return getRegionManagerCounter(rm, name);
+  };
+  const auto offloaded = counter("navy_bc_flush_copy_offloaded_ops");
+  const auto submit = counter("navy_bc_flush_copy_submit_fallback_ops");
+  const auto completion = counter("navy_bc_flush_copy_completion_fallback_ops");
+  EXPECT_GE(offloaded, 0);
+  EXPECT_GE(submit, 0);
+  EXPECT_GE(completion, 0);
+  EXPECT_EQ(attempts, offloaded + submit + completion);
+  EXPECT_EQ(-1, counter("navy_bc_flush_copy_below_min_ops"));
+  EXPECT_EQ(offloaded * regionSize,
+            counter("navy_bc_flush_copy_offloaded_bytes"));
 }
 } // namespace
 
@@ -192,7 +210,7 @@ TEST(RegionManager, Recovery) {
 namespace {
 void testReadWrite(bool directFlush,
                    bool flushCopyOffload,
-                   bool forceCopyOffloadForTest = false) {
+                   bool copyOffloadActiveForTest = false) {
   constexpr uint64_t kBaseOffset = 1024;
   constexpr uint32_t kNumRegions = 4;
   constexpr uint32_t kRegionSize = 4 * 1024;
@@ -208,8 +226,8 @@ void testReadWrite(bool directFlush,
       kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
       true /* workerFlushAsync */, false /* allowReadDuringReclaim */,
       false /* recoverEvictionPolicy */, directFlush, flushCopyOffload);
-  if (forceCopyOffloadForTest) {
-    RegionManagerTestPeer::enableCopyOffload(*rm);
+  if (flushCopyOffload && !directFlush) {
+    RegionManagerTestPeer::setCopyOffloadActive(*rm, copyOffloadActiveForTest);
   }
 
   ENABLE_INJECT_PAUSE_IN_SCOPE();
@@ -253,6 +271,22 @@ void testReadWrite(bool directFlush,
   Buffer bufReadDirect{kSize};
   EXPECT_TRUE(devicePtr->read(expectedOfs, kSize, bufReadDirect.data()));
   EXPECT_EQ(buf.view(), bufReadDirect.view());
+
+  const auto counter = [&](folly::StringPiece name) {
+    return getRegionManagerCounter(*rm, name);
+  };
+  if (!flushCopyOffload) {
+    // DSA flush-copy counters exist only when that copy path is configured.
+    EXPECT_EQ(-1, counter("navy_bc_flush_copy_active"));
+    EXPECT_EQ(-1, counter("navy_bc_flush_copy_total_bytes"));
+    EXPECT_EQ(-1, counter("navy_bc_flush_copy_offloaded_bytes"));
+    return;
+  }
+  const bool active = !directFlush && copyOffloadActiveForTest;
+  EXPECT_EQ(active, counter("navy_bc_flush_copy_active"));
+  const auto copiedBytes = directFlush ? 0 : kRegionSize;
+  EXPECT_EQ(copiedBytes, counter("navy_bc_flush_copy_total_bytes"));
+  expectFlushCopyOutcomes(*rm, kRegionSize, active ? 1 : 0);
 }
 } // namespace
 
@@ -269,7 +303,7 @@ TEST(RegionManager, ReadWriteCopyOffload) {
 
 TEST(RegionManager, ReadWriteWithActiveCopyOffload) {
   testReadWrite(false /* directFlush */, true /* flushCopyOffload */,
-                true /* forceCopyOffloadForTest */);
+                true /* copyOffloadActiveForTest */);
 }
 
 TEST(RegionManager, CopyOffloadWriteFailureAndRetry) {
@@ -283,7 +317,7 @@ TEST(RegionManager, CopyOffloadWriteFailureAndRetry) {
       kFlushRetryLimit, true /* workerFlushAsync */,
       false /* allowReadDuringReclaim */, false /* recoverEvictionPolicy */,
       false /* directFlush */, true /* flushCopyOffload */);
-  RegionManagerTestPeer::enableCopyOffload(rm);
+  RegionManagerTestPeer::setCopyOffloadActive(rm, true);
 
   BufferGen bg;
   std::vector<Buffer> expected;
@@ -323,6 +357,11 @@ TEST(RegionManager, CopyOffloadWriteFailureAndRetry) {
 
   ASSERT_EQ(3, writes);
   EXPECT_EQ(1, getRegionManagerCounter(rm, "navy_bc_inmem_flush_retries"));
+  const auto counter = [&](folly::StringPiece name) {
+    return getRegionManagerCounter(rm, name);
+  };
+  EXPECT_EQ(3 * kRegionSize, counter("navy_bc_flush_copy_total_bytes"));
+  expectFlushCopyOutcomes(rm, kRegionSize, 3);
 }
 
 TEST(RegionManager, RecoveryLRUOrder) {

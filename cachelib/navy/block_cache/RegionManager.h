@@ -29,6 +29,7 @@
 #include "cachelib/navy/block_cache/Region.h"
 #include "cachelib/navy/block_cache/Types.h"
 #include "cachelib/navy/common/Buffer.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Device.h"
 #include "cachelib/navy/common/NavyThread.h"
 #include "cachelib/navy/common/Types.h"
@@ -392,8 +393,12 @@ class RegionManager {
   // Whether to write region buffer directly without intermediate copy
   const bool directFlush_{false};
 
+  const bool flushCopyOffloadConfigured_{false};
   // Cleared at construction for direct flush or a failed self-check.
   bool flushCopyOffload_{false};
+  // Include copies repeated after failed writes.
+  mutable AtomicCounter flushCopyBytes_;
+  OffloadStats flushCopyOffloadStats_;
 
   const RegionEvictCallback evictCb_;
   const RegionCleanupCallback cleanupCb_;

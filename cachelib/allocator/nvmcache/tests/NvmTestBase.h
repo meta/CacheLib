@@ -221,6 +221,18 @@ class NvmCacheTest : public testing::Test {
     getNvmCache()->copyBlobData(dest, src, size);
   }
 
+  bool hasNvmStat(const std::string& name) {
+    return getNvmCache()->getStatsMap().toMap().count(name) > 0;
+  }
+
+  // Fails the test when the stat is not exported.
+  uint64_t nvmStat(const std::string& name) {
+    const auto stats = getNvmCache()->getStatsMap().toMap();
+    const auto it = stats.find(name);
+    EXPECT_NE(stats.end(), it) << name;
+    return it == stats.end() ? 0 : static_cast<uint64_t>(it->second);
+  }
+
   // Helper for ShardHashIsNotFillMapHash because we're the friend of NvmCache.
   std::pair<size_t, size_t> getNvmShardAndHashForKey(folly::StringPiece key) {
     auto nvm = getNvmCache();

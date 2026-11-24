@@ -297,8 +297,15 @@ std::shared_ptr<BlockCacheReinsertionPolicy> BlockCache::makeReinsertionPolicy(
 }
 
 uint32_t BlockCache::valueChecksum(BufferView value) const {
-  if (checksumOffload_ && value.size() >= checksumOffloadReadMinSize_) {
-    return checksumWithOverlap(value, [] {});
+  if (checksumOffload_) {
+    if (value.size() >= checksumOffloadReadMinSize_) {
+      AsyncChecksumOp op;
+      op.submitChecksum(value);
+      const auto crc = op.wait();
+      crcOffloadStats_.record(op.outcome(), value.size());
+      return crc;
+    }
+    crcOffloadStats_.record(OffloadOutcome::BELOW_MIN, value.size());
   }
   return checksum(value, checksumType_);
 }
@@ -1387,14 +1394,17 @@ void BlockCache::writeEntry(MutableBufferView buffer,
     }
   };
 
-  if (checksumData_ && !precomputedChecksum.has_value() && checksumOffload_ &&
-      value.size() >= checksumOffloadMinSize_) {
+  const bool canOffload =
+      checksumData_ && !precomputedChecksum.has_value() && checksumOffload_;
+  if (canOffload && value.size() >= checksumOffloadMinSize_) {
     // Finish metadata writes before DSA submission to avoid false sharing.
     // cs is excluded from csSelf, so it can be filled in after completion.
     writeDescAndKey();
-    const uint32_t cs = copyAndChecksum(
-        buffer.data(), value, [] {}, checksumOffloadCacheControl_);
-    desc->cs = cs;
+    AsyncChecksumOp op;
+    op.submitCopyAndChecksum(buffer.data(), value,
+                             checksumOffloadCacheControl_);
+    desc->cs = op.wait();
+    copyCrcOffloadStats_.record(op.outcome(), value.size());
   } else {
     writeDescAndKey();
     if (checksumData_) {
@@ -1403,6 +1413,9 @@ void BlockCache::writeEntry(MutableBufferView buffer,
                      : checksum(value, checksumType_);
     }
     std::memcpy(buffer.data(), value.data(), value.size());
+    if (canOffload) {
+      copyCrcOffloadStats_.record(OffloadOutcome::BELOW_MIN, value.size());
+    }
   }
 
   logicalWrittenCount_.add(logicalWriteSize);
@@ -1558,6 +1571,10 @@ uint64_t BlockCache::getCounters(const CounterVisitor& visitor) const {
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_lookup_false_positives", lookupFalsePositiveCount_.get(),
           CounterVisitor::CounterType::RATE);
+  if (checksumOffload_) {
+    crcOffloadStats_.getCounters(visitor, "navy_bc_crc");
+    copyCrcOffloadStats_.getCounters(visitor, "navy_bc_copy_crc");
+  }
   visitor("navy_bc_lookup_entry_header_checksum_errors",
           lookupEntryHeaderChecksumErrorCount_.get(),
           CounterVisitor::CounterType::RATE);

@@ -1570,6 +1570,13 @@ TEST_F(NvmCacheTest, NavyStats) {
     return false;
   };
 
+  // DSA copy-out stats exist only when copy-out offload is configured.
+  for (const auto* name :
+       {"copy_out_active", "copy_out_ops", "copy_out_offloaded_ops",
+        "copy_out_bytes", "copy_out_offloaded_bytes"}) {
+    EXPECT_FALSE(cs(name)) << name;
+  }
+
   // navy::Driver
   EXPECT_TRUE(cs("navy_total_usable_size"));
   EXPECT_TRUE(cs("navy_inserts"));
@@ -1788,6 +1795,11 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bc_lru_region_hits_estimate_p99999"));
   EXPECT_TRUE(cs("navy_bc_lru_region_hits_estimate_p999999"));
   EXPECT_TRUE(cs("navy_bc_lru_region_hits_estimate_max"));
+
+  // DSA flush-copy counters exist only when that copy path is configured.
+  for (const auto* suffix : {"active", "total_bytes", "offloaded_bytes"}) {
+    EXPECT_FALSE(cs(fmt::format("navy_bc_flush_copy_{}", suffix))) << suffix;
+  }
 
   // navy::BigHash
   EXPECT_TRUE(cs("navy_bh_size"));
@@ -2484,6 +2496,77 @@ TEST_F(NvmCacheTest, testCreateItemAsIOBufChained) {
   }
 }
 
+TEST_F(NvmCacheTest, CopyOutDisabledSkipsAccounting) {
+  auto config = *getConfig().nvmConfig;
+  config.copyOutOffload = false;
+  config.copyOutOffloadMinSize = 4096;
+  getConfig().enableNvmCache(config);
+  makeCache();
+  const std::string source(65536, 'x');
+  std::string destination(source.size(), '\0');
+  copyBlobForTesting(nullptr, nullptr, 0);
+  copyBlobForTesting(destination.data(), source.data(), 63);
+  copyBlobForTesting(destination.data(), source.data(), 4096);
+  copyBlobForTesting(destination.data(), source.data(), source.size());
+  EXPECT_EQ(source, destination);
+  for (const auto* name :
+       {"copy_out_active", "copy_out_ops", "copy_out_offloaded_ops",
+        "copy_out_bytes", "copy_out_offloaded_bytes", "copy_out_below_min_ops",
+        "copy_out_submit_fallback_ops", "copy_out_completion_fallback_ops"}) {
+    EXPECT_FALSE(hasNvmStat(name)) << name;
+  }
+}
+
+TEST_F(NvmCacheTest, CopyOutUnavailableAndThresholdAccounting) {
+  constexpr uint32_t kMinSize = 4096;
+  constexpr uint32_t kSmallCopySize = kMinSize - 1;
+  auto config = *getConfig().nvmConfig;
+  config.copyOutOffload = true;
+  config.copyOutOffloadMinSize = kMinSize;
+  getConfig().enableNvmCache(config);
+  makeCache();
+  const std::string source(65536, 'y');
+  std::string destination(source.size(), '\0');
+
+  // Model a failed probe independently of the host's accelerator availability.
+  setCopyOutActiveForTesting(false);
+  copyBlobForTesting(nullptr, nullptr, 0);
+  EXPECT_EQ(0, nvmStat("copy_out_ops"));
+  copyBlobForTesting(destination.data(), source.data(), kSmallCopySize);
+  copyBlobForTesting(destination.data(), source.data(), source.size());
+  EXPECT_EQ(0, nvmStat("copy_out_active"));
+  EXPECT_EQ(source, destination);
+  EXPECT_EQ(2, nvmStat("copy_out_ops"));
+  EXPECT_EQ(0, nvmStat("copy_out_offloaded_ops"));
+  EXPECT_EQ(source.size() + kSmallCopySize, nvmStat("copy_out_bytes"));
+  EXPECT_EQ(0, nvmStat("copy_out_offloaded_bytes"));
+  EXPECT_FALSE(hasNvmStat("copy_out_fallback_bytes"));
+  for (const auto* outcome :
+       {"below_min", "submit_fallback", "completion_fallback"}) {
+    EXPECT_EQ(0, nvmStat(fmt::format("copy_out_{}_ops", outcome)));
+    EXPECT_FALSE(hasNvmStat(fmt::format("copy_out_{}_bytes", outcome)));
+  }
+
+  setCopyOutActiveForTesting(true);
+  copyBlobForTesting(destination.data(), source.data(), kSmallCopySize);
+  EXPECT_EQ(3, nvmStat("copy_out_ops"));
+  EXPECT_EQ(0, nvmStat("copy_out_offloaded_ops"));
+  EXPECT_EQ(0, nvmStat("copy_out_offloaded_bytes"));
+  EXPECT_EQ(1, nvmStat("copy_out_below_min_ops"));
+
+  copyBlobForTesting(destination.data(), source.data(), kMinSize);
+  EXPECT_EQ(source, destination);
+  EXPECT_EQ(4, nvmStat("copy_out_ops"));
+  EXPECT_EQ(source.size() + 2 * kSmallCopySize + kMinSize,
+            nvmStat("copy_out_bytes"));
+  const auto offloadedOps = nvmStat("copy_out_offloaded_ops");
+  const auto fallbackOps = nvmStat("copy_out_submit_fallback_ops") +
+                           nvmStat("copy_out_completion_fallback_ops");
+  EXPECT_EQ(1, offloadedOps + fallbackOps);
+  EXPECT_EQ(kMinSize * offloadedOps, nvmStat("copy_out_offloaded_bytes"));
+  EXPECT_EQ(1, nvmStat("copy_out_active"));
+}
+
 TEST_F(NvmCacheTest, CopyOutRestoresParentAndChainedPayloads) {
   for (const auto [enabled, threshold] : {std::pair<bool, uint32_t>{false, 0},
                                           {true, 0},
@@ -2513,20 +2596,36 @@ TEST_F(NvmCacheTest, CopyOutRestoresParentAndChainedPayloads) {
     }
 
     auto nvmItem = makeNvmItem(*handle);
+    const uint64_t beforeCopy = enabled ? nvmStat("copy_out_bytes") : 0;
     auto iobuf = createItemAsIOBuf(key, *nvmItem);
     ASSERT_NE(nullptr, iobuf);
     verifyItemInIOBuf(key, handle, iobuf.get());
+    constexpr uint64_t kBlobBytes = kValueSize + 4095 + 4096 + 4097;
+    if (enabled) {
+      EXPECT_EQ(kBlobBytes, nvmStat("copy_out_bytes") - beforeCopy);
+    } else {
+      EXPECT_FALSE(hasNvmStat("copy_out_bytes"));
+    }
 
     ASSERT_TRUE(pushToNvmCacheFromRamForTesting(key));
     allocator.flushNvmCache();
     handle.reset();
     removeFromRamForTesting(key);
     ASSERT_FALSE(checkKeyExists(key, true));
+    const uint64_t beforePromotion = enabled ? nvmStat("copy_out_bytes") : 0;
     auto promoted = fetch(key, false);
     ASSERT_NE(nullptr, promoted);
     ASSERT_TRUE(promoted.wentToNvm());
     ASSERT_TRUE(promoted->isNvmClean());
     verifyItemInIOBuf(key, promoted, iobuf.get());
+    if (!enabled) {
+      continue;
+    }
+    EXPECT_EQ(kBlobBytes, nvmStat("copy_out_bytes") - beforePromotion);
+    // Below-threshold copies bypass the offload attempt counters.
+    if (threshold == UINT32_MAX) {
+      EXPECT_EQ(0, nvmStat("copy_out_offloaded_bytes"));
+    }
   }
 }
 

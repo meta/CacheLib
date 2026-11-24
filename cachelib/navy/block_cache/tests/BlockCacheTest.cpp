@@ -289,6 +289,58 @@ TEST(BlockCache, InsertLookupChecksumOffload) {
       }});
 }
 
+TEST(BlockCache, ChecksumOffloadStatsSeparateReadAndWriteMinimums) {
+  constexpr size_t kWriteMinSize = 1024;
+  auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+  auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);
+  config.checksum = true;
+  config.checksumOffload = true;
+  config.checksumType = ChecksumType::Crc32c;
+  config.checksumOffloadMinSize = kWriteMinSize;
+  config.checksumOffloadReadMinSize = 2 * kWriteMinSize;
+  auto driver = makeDriver(makeEngine(std::move(config)), makeJobScheduler());
+
+  auto readRates = [&] {
+    std::map<std::string, double> counters;
+    driver->getCounters({[&](folly::StringPiece name, double count,
+                             CounterVisitor::CounterType type) {
+      if (type == CounterVisitor::CounterType::RATE) {
+        counters.emplace(name.str(), count);
+      }
+    }});
+    return counters;
+  };
+
+  BufferGen bg;
+  CacheEntry small{strzBuffer("small"), bg.gen(kWriteMinSize - 1)};
+  CacheEntry atMinimum{strzBuffer("at-minimum"), bg.gen(kWriteMinSize)};
+  for (const auto* entry : {&small, &atMinimum}) {
+    ASSERT_EQ(Status::Ok, driver->insert(entry->key(), entry->value()));
+  }
+
+  const auto afterInsert = readRates();
+  EXPECT_EQ(0, afterInsert.at("navy_bc_crc_below_min_ops"));
+  EXPECT_EQ(1, afterInsert.at("navy_bc_copy_crc_below_min_ops"));
+  const auto offloaded = afterInsert.at("navy_bc_copy_crc_offloaded_ops");
+  EXPECT_EQ(atMinimum.value().size() * offloaded,
+            afterInsert.at("navy_bc_copy_crc_offloaded_bytes"));
+  EXPECT_EQ(1, offloaded +
+                   afterInsert.at("navy_bc_copy_crc_submit_fallback_ops") +
+                   afterInsert.at("navy_bc_copy_crc_completion_fallback_ops"));
+
+  for (const auto* entry : {&small, &atMinimum}) {
+    Buffer value;
+    uint32_t lat = 0;
+    ASSERT_EQ(Status::Ok, driver->lookup(entry->key(), value, lat));
+    EXPECT_EQ(entry->value(), value.view());
+  }
+
+  const auto afterLookup = readRates();
+  EXPECT_EQ(2, afterLookup.at("navy_bc_crc_below_min_ops"));
+  EXPECT_EQ(0, afterLookup.at("navy_bc_crc_offloaded_bytes"));
+  EXPECT_EQ(1, afterLookup.at("navy_bc_copy_crc_below_min_ops"));
+}
+
 TEST(BlockCache, ChecksumOffloadRequiresCrc32c) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto config = makeConfig(std::make_unique<FifoPolicy>(), *device);

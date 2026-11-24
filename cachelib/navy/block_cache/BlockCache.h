@@ -31,6 +31,7 @@
 #include "cachelib/navy/block_cache/EvictionPolicy.h"
 #include "cachelib/navy/block_cache/Index.h"
 #include "cachelib/navy/block_cache/RegionManager.h"
+#include "cachelib/navy/common/ChecksumOffload.h"
 #include "cachelib/navy/common/Device.h"
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/engine/Engine.h"
@@ -617,6 +618,9 @@ class BlockCache final : public Engine {
   // Make sure that this class member is defined after index_.
   std::shared_ptr<BlockCacheReinsertionPolicy> reinsertionPolicy_;
   std::optional<std::reference_wrapper<LegacyEventTracker>> legacyEventTracker_;
+
+  mutable OffloadStats crcOffloadStats_;
+  OffloadStats copyCrcOffloadStats_;
 
   // thread local counters in synchronized/critical path
   mutable TLCounter lookupCount_;

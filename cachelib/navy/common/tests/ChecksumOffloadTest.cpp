@@ -58,10 +58,12 @@ TEST(ChecksumOffload, PlainCopyMatchesSoftware) {
     SCOPED_TRACE(size);
     const auto src = randomBytes(size, seed++);
     std::vector<uint8_t> dst(size, 0xAA);
-    const bool onDevice = copyWithOffload(dst.data(), src.data(), size);
+    AsyncChecksumOp op;
+    op.submitCopy(dst.data(), BufferView{src.size(), src.data()}, true);
+    EXPECT_EQ(0u, op.wait());
     EXPECT_EQ(0, std::memcmp(src.data(), dst.data(), size));
     if (!checksumOffloadSupported()) {
-      EXPECT_FALSE(onDevice);
+      EXPECT_FALSE(op.completedOnDevice());
     }
   }
 }
@@ -103,7 +105,6 @@ TEST(ChecksumOffload, EmptyCopiesDoNotReportDeviceWork) {
   const uint8_t src = 0x5A;
   uint8_t dst = 0xA5;
   const auto checksumBefore = getChecksumWaitStats();
-  EXPECT_FALSE(copyWithOffload(&dst, &src, 0));
   AsyncChecksumOp op;
   op.submitCopy(&dst, BufferView{0, &src}, true /* cacheControl */);
   EXPECT_EQ(0u, op.wait());
@@ -119,54 +120,40 @@ TEST(ChecksumOffload, CopyAndChecksumMatchesSoftware) {
     std::vector<uint8_t> dst(size, 0xAA);
     const BufferView view{src.size(), src.data()};
 
-    const uint32_t cs = copyAndChecksum(dst.data(), view, [] {});
+    AsyncChecksumOp op;
+    op.submitCopyAndChecksum(dst.data(), view, true);
+    const uint32_t cs = op.wait();
     EXPECT_EQ(checksum(view, ChecksumType::Crc32c), cs) << "size=" << size;
     EXPECT_EQ(0, std::memcmp(src.data(), dst.data(), size)) << "size=" << size;
   }
 }
 
-TEST(ChecksumOffload, ChecksumWithOverlapMatchesSoftware) {
+TEST(ChecksumOffload, ChecksumMatchesSoftware) {
   uint32_t seed = 100;
   for (auto size : kSizes) {
     auto src = randomBytes(size, seed++);
     const BufferView view{src.size(), src.data()};
-    EXPECT_EQ(checksum(view, ChecksumType::Crc32c),
-              checksumWithOverlap(view, [] {}))
+    AsyncChecksumOp op;
+    op.submitChecksum(view);
+    EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait())
         << "size=" << size;
   }
 }
 
-TEST(ChecksumOffload, OverlapRunsExactlyOnce) {
-  for (auto size : {175UL, 1024UL * 1024UL}) {
-    auto src = randomBytes(size, 7);
-    std::vector<uint8_t> dst(size, 0);
-    const BufferView view{src.size(), src.data()};
-
-    int copyOverlapRuns = 0;
-    copyAndChecksum(dst.data(), view, [&] { copyOverlapRuns++; });
-    EXPECT_EQ(1, copyOverlapRuns) << "size=" << size;
-
-    int crcOverlapRuns = 0;
-    checksumWithOverlap(view, [&] { crcOverlapRuns++; });
-    EXPECT_EQ(1, crcOverlapRuns) << "size=" << size;
-  }
-}
-
-// The overlap callback is allowed to read the source range concurrently with
-// the operation (e.g. BigHash rebuilds its bloom filter from the bucket while
-// DSA checksums it).
+// BigHash can read the source to rebuild its bloom filter while DSA checksums
+// the bucket.
 TEST(ChecksumOffload, OverlapMayReadSource) {
   const size_t size = 64 * 1024;
   auto src = randomBytes(size, 11);
   const BufferView view{src.size(), src.data()};
 
+  AsyncChecksumOp op;
+  op.submitChecksum(view);
   uint64_t sum = 0;
-  const uint32_t cs = checksumWithOverlap(view, [&] {
-    for (auto b : src) {
-      sum += b;
-    }
-  });
-  EXPECT_EQ(checksum(view, ChecksumType::Crc32c), cs);
+  for (auto b : src) {
+    sum += b;
+  }
+  EXPECT_EQ(checksum(view, ChecksumType::Crc32c), op.wait());
   EXPECT_NE(0ULL, sum);
 }
 
@@ -297,14 +284,18 @@ TEST(ChecksumOffload, CopyToAdjacentRanges) {
     const BufferView view{kSize, src};
     const auto expectedCrc = checksum(view, ChecksumType::Crc32c);
 
-    EXPECT_EQ(expectedCrc, copyAndChecksum(dest, view, [] {}));
+    AsyncChecksumOp op;
+    op.submitCopyAndChecksum(dest, view, true);
+    EXPECT_EQ(expectedCrc, op.wait());
     EXPECT_EQ(expected, std::vector<uint8_t>(dest, dest + kSize));
   }
 }
 
 TEST(ChecksumOffload, EmptyCopyPreservesDestination) {
   uint8_t dest = 0x5A;
-  EXPECT_EQ(0u, copyAndChecksum(&dest, BufferView{0, nullptr}, [] {}));
+  AsyncChecksumOp op;
+  op.submitCopyAndChecksum(&dest, BufferView{0, nullptr}, true);
+  EXPECT_EQ(0u, op.wait());
   EXPECT_EQ(0x5A, dest);
 }
 
@@ -342,17 +333,20 @@ TEST(ChecksumOffloadDeathTest, DoubleWaitIsRejected) {
 TEST(ChecksumOffloadDeathTest, CopyRejectsSameBuffer) {
   auto buffer = randomBytes(16, 92);
   const BufferView view{8, buffer.data()};
-  EXPECT_DEATH(copyAndChecksum(buffer.data(), view, [] {}), "must not overlap");
+  AsyncChecksumOp op;
+  EXPECT_DEATH(op.submitCopyAndChecksum(buffer.data(), view, true),
+               "must not overlap");
 }
 
 TEST(ChecksumOffloadDeathTest, CopyRejectsPartialOverlap) {
   auto buffer = randomBytes(16, 93);
-  EXPECT_DEATH(
-      copyAndChecksum(buffer.data() + 1, BufferView{8, buffer.data()}, [] {}),
-      "must not overlap");
-  EXPECT_DEATH(
-      copyAndChecksum(buffer.data(), BufferView{8, buffer.data() + 1}, [] {}),
-      "must not overlap");
+  AsyncChecksumOp op;
+  EXPECT_DEATH(op.submitCopyAndChecksum(buffer.data() + 1,
+                                        BufferView{8, buffer.data()}, true),
+               "must not overlap");
+  EXPECT_DEATH(op.submitCopyAndChecksum(buffer.data(),
+                                        BufferView{8, buffer.data() + 1}, true),
+               "must not overlap");
 }
 #endif
 
