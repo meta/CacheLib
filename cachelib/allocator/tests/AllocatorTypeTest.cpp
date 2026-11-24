@@ -406,6 +406,10 @@ TYPED_TEST(BaseAllocatorTest, DumpEvictionIterator) {
   this->testDumpEvictionIterator();
 }
 
+TYPED_TEST(BaseAllocatorTest, GetEvictionCandidateKeys) {
+  this->testGetEvictionCandidateKeys();
+}
+
 // test config validation
 TYPED_TEST(BaseAllocatorTest, ConfigValidation) {
   this->testConfigValidation();

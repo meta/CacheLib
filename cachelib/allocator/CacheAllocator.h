@@ -1449,6 +1449,17 @@ class CacheAllocator : public CacheBase {
                                                 ClassId cid,
                                                 size_t numItems = 10);
 
+  // Returns a bounded snapshot of keys at the eviction tail, excluding chained
+  // children. Chained parents may also be excluded; skipped items still count
+  // toward maxScan. Callers must revalidate items after lookup; this neither
+  // pins nor removes them.
+  std::vector<std::string> getEvictionCandidateKeys(
+      PoolId pid,
+      ClassId cid,
+      size_t maxCandidates,
+      size_t maxScan,
+      bool includeChainedParents = true);
+
   // returns the current count of the active handles that are handed out
   // through the API. This also includes the handles that are maintained by
   // the iterator and internal rebalancing threads.
@@ -5185,6 +5196,41 @@ CacheAllocator<CacheTrait>::getSampleItem() {
   iobuf.markExternallySharedOne();
 
   return SampleItem(std::move(iobuf), allocInfo, false /* fromNvm */);
+}
+
+template <typename CacheTrait>
+std::vector<std::string> CacheAllocator<CacheTrait>::getEvictionCandidateKeys(
+    PoolId pid,
+    ClassId cid,
+    size_t maxCandidates,
+    size_t maxScan,
+    bool includeChainedParents) {
+  const auto& pool = allocator_->getPool(pid);
+  if (cid < 0 || static_cast<unsigned>(cid) >= pool.getNumClassId()) {
+    throw std::invalid_argument("Invalid allocation class");
+  }
+  std::vector<std::string> keys;
+  keys.reserve(std::min(maxCandidates, maxScan));
+  size_t scanned = 0;
+  const auto first = isMMContainerSharded() ? pickEvictionShard(pid, cid) : 0;
+  for (uint32_t offset = 0; offset < config_.mmContainerShards &&
+                            keys.size() < maxCandidates && scanned < maxScan;
+       ++offset) {
+    auto& mm = getMMContainerShard(
+        pid, cid, (first + offset) % config_.mmContainerShards);
+    mm.withEvictionIterator([&](auto&& it) {
+      while (it && keys.size() < maxCandidates && scanned < maxScan) {
+        ++scanned;
+        if (!it->isChainedItem() && it->getRefCount() == 0 &&
+            (includeChainedParents || !it->hasChainedItem())) {
+          const auto key = it->getKey();
+          keys.emplace_back(key.data(), key.size());
+        }
+        ++it;
+      }
+    });
+  }
+  return keys;
 }
 
 template <typename CacheTrait>

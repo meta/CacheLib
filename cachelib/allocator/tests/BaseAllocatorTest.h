@@ -6150,6 +6150,47 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     }
   }
 
+  void testGetEvictionCandidateKeys() {
+    typename AllocatorT::Config config;
+    config.setCacheSize(10 * Slab::kSize);
+    AllocatorT alloc(config);
+    const auto pid =
+        alloc.addPool("one", alloc.getCacheMemoryStats().ramCacheSize);
+
+    const std::vector<std::string> expected{"key0", "key1", "key2"};
+    for (const auto& key : expected) {
+      util::allocateAccessible(alloc, pid, key, 10);
+    }
+    auto held = util::allocateAccessible(alloc, pid, "held", 10);
+    const auto cid = alloc.getAllocInfo(held->getMemory()).classId;
+    {
+      auto parent = util::allocateAccessible(alloc, pid, "parent", 10);
+      auto child = alloc.allocateChainedItem(parent, 10);
+      ASSERT_EQ(cid, alloc.getAllocInfo(parent->getMemory()).classId);
+      ASSERT_EQ(cid, alloc.getAllocInfo(child->getMemory()).classId);
+      alloc.addChainedItem(parent, std::move(child));
+    }
+
+    auto keys = alloc.getEvictionCandidateKeys(pid, cid, 10, 10);
+    std::sort(keys.begin(), keys.end());
+    auto expectedWithParent = expected;
+    expectedWithParent.push_back("parent");
+    EXPECT_EQ(expectedWithParent, keys);
+    auto unchainedKeys = alloc.getEvictionCandidateKeys(
+        pid, cid, 10, 10, false /* includeChainedParents */);
+    std::sort(unchainedKeys.begin(), unchainedKeys.end());
+    EXPECT_EQ(expected, unchainedKeys);
+    EXPECT_EQ(2, alloc.getEvictionCandidateKeys(pid, cid, 2, 10).size());
+    EXPECT_TRUE(alloc.getEvictionCandidateKeys(pid, cid, 10, 0).empty());
+    for (const auto& key : expected) {
+      alloc.remove(key);
+    }
+    EXPECT_TRUE(alloc
+                    .getEvictionCandidateKeys(pid, cid, 10, 10,
+                                              false /* includeChainedParents */)
+                    .empty());
+  }
+
   void testMMReconfigure() {
     typename AllocatorT::Config config;
     typename AllocatorT::MMConfig mmConfig;
