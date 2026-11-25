@@ -18,11 +18,14 @@
 #include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 #include <numeric>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "cachelib/allocator/CacheAllocator.h"
 #include "cachelib/allocator/nvmcache/BlockCacheReinsertionPolicy.h"
@@ -611,4 +614,64 @@ TEST_F(EventTrackerTest, PreAndPostQueueCallbacks) {
   EXPECT_EQ(*logged.appId, 42);
   EXPECT_TRUE(logged.usecaseId.has_value());
   EXPECT_EQ(*logged.usecaseId, 99);
+}
+
+TEST_F(EventTrackerTest, FailedAllocationRecordsPoolId) {
+  auto inMemorySink = std::make_unique<InMemoryEventSink>();
+  auto* sinkPtr = inMemorySink.get();
+  const auto isFailed = [](const EventInfo& event) {
+    return event.result == AllocatorApiResult::FAILED;
+  };
+
+  std::vector<EventInfo> records;
+  std::string failedKey;
+  PoolId poolId{};
+  {
+    LruAllocator::Config allocConfig;
+    allocConfig.setCacheSize(20 * Slab::kSize);
+    LruAllocator allocator(allocConfig);
+    allocator.addPool("other", Slab::kSize);
+    poolId = allocator.addPool("full", Slab::kSize);
+
+    EventTracker::Config trackerConfig;
+    trackerConfig.sampler = std::make_unique<FurcHashSampler>(1);
+    trackerConfig.queueSize = 100;
+    trackerConfig.eventMask = eventMaskFor(AllocatorApiEvent::ALLOCATE);
+    trackerConfig.eventSink = std::move(inMemorySink);
+    allocator.setEventTracker(std::move(trackerConfig));
+
+    // Items are not evictable until inserted, so holding their handles leaves
+    // nothing to evict once the pool's only slab is used up.
+    constexpr uint32_t kValueSize = 1024 * 1024;
+    constexpr uint32_t kMaxAllocations = 16;
+    std::vector<LruAllocator::WriteHandle> handles;
+    handles.reserve(kMaxAllocations);
+    for (uint32_t i = 0; i < kMaxAllocations && failedKey.empty(); ++i) {
+      auto key = fmt::format("key_{}", i);
+      if (auto handle = allocator.allocate(poolId, key, kValueSize)) {
+        handles.push_back(std::move(handle));
+      } else {
+        failedKey = std::move(key);
+      }
+    }
+    ASSERT_FALSE(failedKey.empty());
+
+    // The sink is destroyed with the allocator, so wait for the background
+    // thread to deliver the failure and capture records while it is alive.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::none_of(records.begin(), records.end(), isFailed)) {
+      ASSERT_TRUE(std::chrono::steady_clock::now() < deadline)
+          << "Timed out after 5 seconds waiting for FAILED event for key "
+          << failedKey << "; received " << records.size() << " records";
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      records = sinkPtr->getRecords();
+    }
+  }
+
+  const auto failed = std::find_if(records.begin(), records.end(), isFailed);
+  ASSERT_NE(failed, records.end());
+  EXPECT_EQ(failed->key, failedKey);
+  ASSERT_TRUE(failed->poolId.has_value());
+  EXPECT_EQ(*failed->poolId, poolId);
 }

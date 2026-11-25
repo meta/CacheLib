@@ -3391,10 +3391,12 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
     } else {
       const uint32_t ttl =
           expiryTime > creationTime ? (expiryTime - creationTime) : 0;
-      recordEventWithoutSampling(
-          AllocatorApiEvent::ALLOCATE, key, AllocatorApiResult::FAILED,
-          EventRecordParams{
-              .size = size, .ttlSecs = ttl, .expiryTime = expiryTime});
+      recordEventWithoutSampling(AllocatorApiEvent::ALLOCATE, key,
+                                 AllocatorApiResult::FAILED,
+                                 EventRecordParams{.size = size,
+                                                   .ttlSecs = ttl,
+                                                   .expiryTime = expiryTime,
+                                                   .poolId = pid});
     }
   }
 
