@@ -523,6 +523,26 @@ inline typename Lru2QAllocator::MMConfig makeMMConfig(
                                   config.useCombinedLockForIterators);
 }
 
+template <>
+inline typename S3FIFOAllocator::MMConfig makeMMConfig(
+    CacheConfig const& config) {
+  return S3FIFOAllocator::MMConfig(config.lruRefreshSec,
+                                   config.lruRefreshRatio,
+                                   config.lruUpdateOnWrite,
+                                   config.lruUpdateOnRead,
+                                   config.tinySizePercent,
+                                   config.ghostSizePercent,
+                                   config.mmReconfigureIntervalSecs,
+                                   config.useCombinedLockForIterators);
+}
+
+template <>
+inline typename TinyLFUAllocator::MMConfig makeMMConfig(
+    CacheConfig const& config) {
+  return TinyLFUAllocator::MMConfig(
+      config.lruRefreshSec, config.lruUpdateOnWrite, config.lruUpdateOnRead);
+}
+
 template <typename Allocator>
 uint64_t Cache<Allocator>::fetchNandWrites() const {
   size_t total = 0;

@@ -144,6 +144,32 @@ struct MM2QCollection {
   1: required map<i32, map<i32, MM2QObject>> pools;
 }
 
+
+
+struct MMS3FIFOConfig {
+  1: required bool updateOnWrite;
+  2: bool updateOnRead = true;
+  3: double smallSizePercent = 0.0;
+  4: double ghostSizePercent = 100.0;
+  6: double lruRefreshRatio = 0.0;
+  7: double lruRefreshTime = 0.0;
+}
+
+struct MMS3FIFOObject {
+  1: required MMS3FIFOConfig config;
+
+  // number of evictions for this MM object.
+  2: i64 evictions = 0;
+
+  // Warm, hot and cold lrus
+  3: required MultiDListObject lrus;
+}
+
+struct MMS3FIFOCollection {
+  1: required map<i32, map<i32, MMS3FIFOObject>> pools;
+}
+
+
 struct MMTinyLFUConfig {
   @thrift.AllowUnsafeRequiredFieldQualifier
   1: required i32 lruRefreshTime;
