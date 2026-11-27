@@ -369,6 +369,12 @@ class PtrCompressor {
             compressed, false /* isMultiTiered */));
   }
 
+  // Prefetches the memory of a compressed pointer that may be stale.
+  void prefetch(const CompressedPtrType& compressed) const noexcept {
+    allocator_.template prefetch<CompressedPtrType>(compressed,
+                                                    false /* isMultiTiered */);
+  }
+
   bool operator==(const PtrCompressor& rhs) const noexcept {
     return &allocator_ == &rhs.allocator_;
   }

@@ -621,6 +621,14 @@ class MemoryAllocator {
     return slabAllocator_.unCompress<CompressedPtrType>(cPtr, isMultiTiered);
   }
 
+  // Prefetches the memory of a possibly stale compressed pointer, see
+  // SlabAllocator::prefetch().
+  template <typename CompressedPtrType>
+  void prefetch(const CompressedPtrType& cPtr,
+                bool isMultiTiered) const noexcept {
+    slabAllocator_.prefetch<CompressedPtrType>(cPtr, isMultiTiered);
+  }
+
   // a special implementation of pointer compression for benchmarking purposes.
   CompressedPtr4B CACHELIB_INLINE compressAlt(const void* ptr) const {
     return slabAllocator_.compressAlt(ptr);
